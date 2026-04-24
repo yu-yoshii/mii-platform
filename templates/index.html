@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>MI Project Manager</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        /* 3つのパネル設定 */
+        .panel { padding: 20px; box-sizing: border-box; height: 100%; border-right: 1px solid #ddd; }
+        .send-panel { width: 25%; background: #fff; }
+        .project-panel { width: 20%; background: #eceff1; overflow-y: auto; }
+        .log-panel { width: 55%; background: #f4f7f6; overflow-y: auto; }
+
+        h3 { color: #2c3e50; font-size: 1.1em; border-bottom: 2px solid #2c3e50; padding-bottom: 5px; margin-top: 0; }
+        input, button { width: 100%; padding: 10px; margin: 8px 0; border-radius: 4px; border: 1px solid #ccc; box-sizing: border-box; }
+        button { background-color: #27ae60; color: white; border: none; font-weight: bold; cursor: pointer; }
+        button:hover { background-color: #219150; }
+
+        /* 実験一覧ボタンのスタイル */
+        .project-btn { background-color: #34495e; margin-bottom: 5px; text-align: left; font-size: 0.9em; }
+        .project-btn.active { background-color: #e67e22; border-left: 5px solid #d35400; }
+
+        /* カードスタイル */
+        .card { background: white; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; align-items: center; gap: 15px; border-left: 5px solid #34495e; }
+        .card img { width: 80px; height: 60px; object-fit: cover; border-radius: 4px; }
+        .badge { background: #34495e; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75em; }
+        .message-card {
+    position: relative; /* ボタンをカードの右上に配置するためだッ！ */
+}
+
+.delete-btn {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: rgba(255, 0, 0, 0.7);
+    color: white;
+    border: none;
+    border-radius: 50%;
+    width: 25px;
+    height: 25px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.delete-btn:hover {
+    background: red;
+}
+    </style>
+</head>
+<body>
+
+    <div class="panel send-panel">
+        <h3>データ送信</h3>
+        <p id="status" style="color:red; font-size:0.8em;">接続中...</p>
+        <input type="text" id="project_name" placeholder="実験名 (例: 実験1)">
+        <input type="text" id="material_name" placeholder="試料名">
+        <input type="text" id="message" placeholder="条件等">
+        <input type="file" id="image_file" multiple>
+        <button onclick="send()">保存</button>
+    </div>
+
+    <div class="panel project-panel">
+        <h3>実験一覧</h3>
+        <div id="project_list">
+            <button class="project-btn active" onclick="filterProject('すべて')">すべて表示</button>
+        </div>
+    </div>
+
+    <div class="panel log-panel">
+        <div style="display:flex; justify-content:space-between;">
+            <h3>実験ログ</h3>
+            <button id="sort_btn" style="width:auto; padding:5px 10px; font-size:0.8em;">新しい順</button>
+        </div>
+        <div id="display"></div>
+    </div>
+
+    <script>
+        const socket = io({ transports: ['websocket'] });
+        let allData = [];
+        let currentProject = 'すべて';
+        let isNewest = false;
+
+        socket.on('connect', () => {
+            document.getElementById('status').innerText = "接続完了";
+            document.getElementById('status').style.color = "green";
+            socket.emit('load messages');
+        });
+
+        // --- 送信処理（一括対応・非同期版だッ！） ---
+        async function send() {
+            const projInput = document.getElementById('project_name');
+            const matInput = document.getElementById('material_name');
+            const msgInput = document.getElementById('message');
+            const fileInput = document.getElementById('image_file');
+            
+            const files = fileInput.files;
+            if (files.length === 0) return alert("画像を選択してくださいッ！");
+
+            // ファイルを1枚ずつ順番に処理するぜッ！
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                
+                const imageData = await new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onload = (e) => resolve(e.target.result);
+                    reader.readAsDataURL(file);
+                });
+
+                // サーバーへ射出ッ！試料名に (1), (2)... と番号を振るぜ
+                socket.emit('send message', { 
+                    project_name: projInput.value, 
+                    material_name: files.length > 1 ? `${matInput.value} (${i + 1})` : matInput.value,
+                    message: msgInput.value, 
+                    image_data: imageData 
+                });
+            }
+            
+            // 全部送り終わったら入力欄を掃除だッ！
+            msgInput.value = '';
+            fileInput.value = '';
+            // alert(`${files.length}枚の送信を開始したぜッ！`); // うるさければ消してOK
+        }
+
+        // --- 受信・削除処理 ---
+        socket.on('load all messages', (data) => {
+            allData = data; 
+            updateUI();
+        });
+
+        socket.on('load one message', (data) => { 
+            allData.push(data); 
+            updateUI(); 
+        });
+
+        socket.on('message deleted', (data) => {
+            allData = allData.filter(d => d._id !== data.id);
+            updateUI();
+        });
+
+        function deleteMsg(id) {
+            if (confirm("このデータを削除してもいいんだな？ 覚悟はいいか？")) {
+                socket.emit('delete message', { id: id });
+            }
+        }
+
+        // --- UI更新処理 ---
+        function updateUI() {
+            const display = document.getElementById('display');
+            if (!display) return;
+
+            updateProjectList();
+            
+            let filteredData = currentProject === 'すべて' 
+                ? allData 
+                : allData.filter(d => (d.project_name || '未分類') === currentProject);
+
+            if (isNewest) {
+                filteredData = [...filteredData].reverse();
+            }
+
+            display.innerHTML = filteredData.map(msg => `
+                <div class="card message-card" id="msg-${msg._id}">
+                    <button class="delete-btn" onclick="deleteMsg('${msg._id}')">×</button>
+                    <img src="${msg.image_data}" alt="Material Image">
+                    <div>
+                        <span class="badge">${msg.project_name || '未分類'}</span>
+                        <span class="badge" style="background:#27ae60;">${msg.material_name || '名称不明'}</span>
+                        <p style="margin:5px 0; font-size:0.9em;">${msg.message || '(メモなし)'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateProjectList() {
+            const listDiv = document.getElementById('project_list');
+            const projects = ['すべて', ...new Set(allData.map(d => d.project_name || '未分類'))];
+            
+            listDiv.innerHTML = projects.map(p => 
+                `<button class="project-btn ${currentProject === p ? 'active' : ''}" onclick="filterProject('${p}')">${p}</button>`
+            ).join('');
+        }
+
+        function filterProject(name) {
+            currentProject = name;
+            updateUI();
+        }
+
+        document.getElementById('sort_btn').onclick = () => { 
+            isNewest = !isNewest; 
+            updateUI(); 
+        };
+    </script>
+</body>
+</html>
