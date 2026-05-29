@@ -3,77 +3,340 @@
 <head>
     <meta charset="UTF-8">
     <title>MI Project Manager</title>
+    <!-- Socket.IO と グラフ用ライブラリ Chart.js を読み込みだッ！ -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        :root {
+            --bg-main: #f8fafc;
+            --bg-panel: #ffffff;
+            --bg-sidebar: #0f172a;
+            --text-main: #334155;
+            --text-light: #94a3b8;
+            --primary: #3b82f6;
+            --success: #10b981;
+            --accent: #f59e0b;
+            --danger: #ef4444;
+            --border: #e2e8f0;
+            --radius: 12px;
+        }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; 
+            background-color: var(--bg-main); 
+            color: var(--text-main); 
+            margin: 0; 
+            display: flex; 
+            height: 100vh; 
+            overflow: hidden; 
+        }
         
-        /* 3つのパネル設定 */
-        .panel { padding: 20px; box-sizing: border-box; height: 100%; border-right: 1px solid #ddd; }
-        .send-panel { width: 25%; background: #fff; }
-        .project-panel { width: 20%; background: #eceff1; overflow-y: auto; }
-        .log-panel { width: 55%; background: #f4f7f6; overflow-y: auto; }
+        .panel { 
+            padding: 24px; 
+            box-sizing: border-box; 
+            height: 100vh; 
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .send-panel { 
+            width: 28%; 
+            background: var(--bg-panel); 
+            border-right: 1px solid var(--border);
+            overflow-y: auto;
+            box-shadow: 2px 0 8px rgba(0,0,0,0.02);
+        }
+        
+        .project-panel { 
+            width: 20%; 
+            background: var(--bg-sidebar); 
+            color: #fff;
+            overflow-y: auto; 
+        }
+        
+        .log-panel { 
+            width: 52%; 
+            background: var(--bg-main); 
+            overflow-y: auto; 
+        }
 
-        h3 { color: #2c3e50; font-size: 1.1em; border-bottom: 2px solid #2c3e50; padding-bottom: 5px; margin-top: 0; }
-        input, button { width: 100%; padding: 10px; margin: 8px 0; border-radius: 4px; border: 1px solid #ccc; box-sizing: border-box; }
-        button { background-color: #27ae60; color: white; border: none; font-weight: bold; cursor: pointer; }
-        button:hover { background-color: #219150; }
+        h3 { 
+            color: var(--text-main); 
+            font-size: 1.2em; 
+            font-weight: 700;
+            margin-top: 0; 
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .project-panel h3 {
+            color: #f1f5f9;
+            border-bottom: 1px solid #334155;
+            padding-bottom: 10px;
+        }
 
-        /* 実験一覧ボタンのスタイル */
-        .project-btn { background-color: #34495e; margin-bottom: 5px; text-align: left; font-size: 0.9em; }
-        .project-btn.active { background-color: #e67e22; border-left: 5px solid #d35400; }
+        .input-group {
+            margin-bottom: 16px;
+        }
+        .input-group label {
+            display: block;
+            font-size: 0.85em;
+            font-weight: 600;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+        input[type="text"], input[type="file"] { 
+            width: 100%; 
+            padding: 10px 14px; 
+            border-radius: var(--radius); 
+            border: 1px solid var(--border); 
+            box-sizing: border-box; 
+            font-size: 0.95em;
+            transition: all 0.2s;
+            background: #f8fafc;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: #fff;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        
+        button { 
+            width: 100%; 
+            padding: 12px; 
+            margin: 8px 0; 
+            border-radius: var(--radius); 
+            border: none;
+            font-weight: 600; 
+            font-size: 0.95em;
+            cursor: pointer; 
+            transition: all 0.2s;
+        }
+        .btn-success { background-color: var(--success); color: white; }
+        .btn-success:hover { background-color: #059669; transform: translateY(-1px); }
+        .btn-primary { background-color: var(--primary); color: white; }
+        .btn-primary:hover { background-color: #2563eb; transform: translateY(-1px); }
+        .btn-outline { background-color: transparent; border: 1px solid var(--border); color: var(--text-main); }
+        .btn-outline:hover { background: #f1f5f9; }
 
-        /* カードスタイル */
-        .card { background: white; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; align-items: center; gap: 15px; border-left: 5px solid #34495e; }
-        .card img { width: 80px; height: 60px; object-fit: cover; border-radius: 4px; }
-        .badge { background: #34495e; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75em; }
-        .message-card {
-    position: relative; /* ボタンをカードの右上に配置するためだッ！ */
-}
+        .project-btn { 
+            background-color: transparent; 
+            color: #94a3b8;
+            margin-bottom: 6px; 
+            text-align: left; 
+            font-size: 0.95em; 
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .project-btn:hover { background-color: #1e293b; color: #f1f5f9; }
+        .project-btn.active { 
+            background-color: var(--primary); 
+            color: white; 
+            font-weight: 600;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
 
-.delete-btn {
-    position: absolute;
-    top: 5px;
-    right: 5px;
-    background: rgba(255, 0, 0, 0.7);
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 25px;
-    height: 25px;
-    cursor: pointer;
-    font-weight: bold;
-}
+        .card { 
+            background: var(--bg-panel); 
+            padding: 16px; 
+            border-radius: var(--radius); 
+            display: flex; 
+            align-items: center; 
+            gap: 20px; 
+            border-left: 6px solid var(--primary); 
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03);
+            position: relative;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.08);
+        }
+        
+        /* 分光カードを目立たせ、クリックできる雰囲気（ポインター）を出す */
+        .csv-card {
+            cursor: pointer;
+        }
+        .csv-card:hover {
+            border-left-color: #8e44ad !important;
+        }
 
-.delete-btn:hover {
-    background: red;
-}
+        .card img { 
+            width: 100px; 
+            height: 75px; 
+            object-fit: cover; 
+            border-radius: 8px; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .badge-wrapper {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .badge { 
+            background: #e2e8f0; 
+            color: #475569; 
+            padding: 4px 10px; 
+            border-radius: 20px; 
+            font-size: 0.75em; 
+            font-weight: 600;
+        }
+        
+        .delete-btn {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: #fee2e2;
+            color: var(--danger);
+            border: none;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.2s, background 0.2s;
+            padding: 0;
+            margin: 0;
+            z-index: 10;
+        }
+        .card:hover .delete-btn { opacity: 1; }
+        .delete-btn:hover { background: var(--danger); color: white; }
+
+        .download-zone {
+            margin-top: auto;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+        }
+        .download-flex {
+            display: flex;
+            gap: 10px;
+        }
+        .download-flex button { font-size: 0.85em; padding: 10px; }
+
+        /* 📊 グラフポップアップ（モーダルウインドウ）のCSS */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(4px);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 100;
+            opacity: 0; pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        .modal-overlay.active {
+            opacity: 1; pointer-events: auto;
+        }
+        .modal-content {
+            background: white;
+            padding: 24px;
+            border-radius: var(--radius);
+            width: 650px;
+            max-width: 90%;
+            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
+            position: relative;
+            transform: scale(0.9);
+            transition: transform 0.3s ease;
+        }
+        .modal-overlay.active .modal-content {
+            transform: scale(1);
+        }
+        .modal-close {
+            position: absolute;
+            top: 15px; right: 15px;
+            background: #f1f5f9; border: none; border-radius: 50%;
+            width: 30px; height: 30px; cursor: pointer;
+            font-weight: bold; color: #64748b;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .modal-close:hover { background: #e2e8f0; color: #334155; }
     </style>
 </head>
 <body>
 
     <div class="panel send-panel">
-        <h3>データ送信</h3>
-        <p id="status" style="color:red; font-size:0.8em;">接続中...</p>
-        <input type="text" id="project_name" placeholder="実験名 (例: 実験1)">
-        <input type="text" id="material_name" placeholder="試料名">
-        <input type="text" id="message" placeholder="条件等">
-        <input type="file" id="image_file" multiple>
-        <button onclick="send()">保存</button>
+        <h3>📊 画像データ解析送信</h3>
+        <p id="status" style="color:var(--danger); font-size:0.85em; font-weight:600; margin-top:-10px; margin-bottom:15px;">接続中...</p>
+        
+        <div class="input-group">
+            <label>実験名 (プロジェクト名)</label>
+            <input type="text" id="project_name" placeholder="例: 実験1">
+        </div>
+        <div class="input-group">
+            <label>試料名 (マテリアル)</label>
+            <input type="text" id="material_name" placeholder="例: サンプルA">
+        </div>
+        <div class="input-group">
+            <label>実験条件・メモ</label>
+            <input type="text" id="message" placeholder="例: 温度25℃, 濃度10%">
+        </div>
+        <div class="input-group">
+            <label>画像ファイル</label>
+            <input type="file" id="image_file" multiple>
+        </div>
+        <button class="btn-success" onclick="send()">画像を解析して保存</button>
+
+        <div style="margin: 30px 0; border-top: 2px dashed var(--border);"></div>
+
+        <h3>📈 分光CSVデータ送信</h3>
+        <div class="input-group">
+            <label>実験名 (プロジェクト名)</label>
+            <input type="text" id="csv_project_name" placeholder="例: 実験1">
+        </div>
+        <div class="input-group">
+            <label>試料名 (マテリアル)</label>
+            <input type="text" id="csv_material_name" placeholder="例: サンプルA(分光)">
+        </div>
+        <div class="input-group">
+            <label>CSVファイル (.csv)</label>
+            <input type="file" id="csv_file" accept=".csv">
+        </div>
+        <button class="btn-primary" onclick="sendCSV()">分光データを保存</button>
+        
+        <div class="download-zone">
+            <label style="font-size: 0.85em; font-weight: 600; color: #64748b; display:block; margin-bottom:5px;">データエクスポート</label>
+            <div class="download-flex">
+                <button class="btn-outline" onclick="downloadCSV()">CSV保存</button>
+                <button class="btn-primary" onclick="downloadExcel()" style="margin:0;">Excel保存</button>
+            </div>
+        </div>
     </div>
 
     <div class="panel project-panel">
-        <h3>実験一覧</h3>
+        <h3> 実験一覧</h3>
         <div id="project_list">
             <button class="project-btn active" onclick="filterProject('すべて')">すべて表示</button>
         </div>
     </div>
 
     <div class="panel log-panel">
-        <div style="display:flex; justify-content:space-between;">
-            <h3>実験ログ</h3>
-            <button id="sort_btn" style="width:auto; padding:5px 10px; font-size:0.8em;">新しい順</button>
+        <div style="display:flex; justify-content:space-between; align-items: center; margin-bottom: 10px;">
+            <h3 style="margin:0;"> 実験ログタイムライン</h3>
+            <button id="sort_btn" style="width:auto; padding:6px 12px; font-size:0.8em; margin:0;" class="btn-outline">新しい順</button>
         </div>
         <div id="display"></div>
+    </div>
+
+    <!-- 📊 グラフ表示用のモーダルポップアップのHTML構造だッ！ -->
+    <div class="modal-overlay" id="graphModal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeModal()">×</button>
+            <h3 id="modalTitle" style="margin-bottom:15px; color:#2980b9;">分光スペクトル確認</h3>
+            <div style="width: 100%; height: 350px;">
+                <canvas id="spectrumChart"></canvas>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -81,24 +344,23 @@
         let allData = [];
         let currentProject = 'すべて';
         let isNewest = false;
+        let myChart = null; // グラフのインスタンス管理用
 
         socket.on('connect', () => {
-            document.getElementById('status').innerText = "接続完了";
-            document.getElementById('status').style.color = "green";
-            socket.emit('load messages');
+            document.getElementById('status').innerText = "● 接続完了";
+            document.getElementById('status').style.color = "var(--success)";
+            socket.emit('load messages'); 
         });
 
-        // --- 送信処理（一括対応・非同期版だッ！） ---
         async function send() {
             const projInput = document.getElementById('project_name');
             const matInput = document.getElementById('material_name');
             const msgInput = document.getElementById('message');
-            const fileInput = document.getElementById('image_file');
+            const fileInput = document.getElementById('image_file');           
             
             const files = fileInput.files;
-            if (files.length === 0) return alert("画像を選択してくださいッ！");
+            if (files.length === 0) return alert("画像を選択してください");
 
-            // ファイルを1枚ずつ順番に処理するぜッ！
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
                 
@@ -108,44 +370,141 @@
                     reader.readAsDataURL(file);
                 });
 
-                // サーバーへ射出ッ！試料名に (1), (2)... と番号を振るぜ
                 socket.emit('send message', { 
-                    project_name: projInput.value, 
-                    material_name: files.length > 1 ? `${matInput.value} (${i + 1})` : matInput.value,
+                    project_name: projInput.value || '未分類', 
+                    material_name: files.length > 1 ? `${matInput.value || '名称不明'} (${i + 1})` : (matInput.value || '名称不明'),
                     message: msgInput.value, 
                     image_data: imageData 
                 });
             }
             
-            // 全部送り終わったら入力欄を掃除だッ！
             msgInput.value = '';
             fileInput.value = '';
-            // alert(`${files.length}枚の送信を開始したぜッ！`); // うるさければ消してOK
         }
 
-        // --- 受信・削除処理 ---
-        socket.on('load all messages', (data) => {
-            allData = data; 
-            updateUI();
-        });
+        function sendCSV() {
+            const projInput = document.getElementById('csv_project_name');
+            const matInput = document.getElementById('csv_material_name');
+            const fileInput = document.getElementById('csv_file');
+            
+            if (fileInput.files.length === 0) return alert("CSVファイルを選択してください");
+            
+            const file = fileInput.files[0];
+            const reader = new FileReader();
+            
+            reader.onload = function(e) {
+                const text = e.target.result;
+                
+                socket.emit('send csv data', {
+                    project_name: projInput.value || '未分類',
+                    material_name: matInput.value || '名称不明',
+                    csv_text: text
+                });
+                
+                fileInput.value = '';
+                alert("分光CSVデータをサーバーに送信しました");
+            };
+            
+            reader.readAsText(file);
+        }
 
-        socket.on('load one message', (data) => { 
-            allData.push(data); 
-            updateUI(); 
-        });
+        socket.on('load all messages', function(messages) {
+    allData = messages.map(msg => {
+        return {
+            _id: msg.id, 
+            project_name: msg.project_name,
+            material_name: msg.material_name,
+            message: msg.message,
+            // 画像なら色相・彩度・明度、CSVなら波長・光度のデータ点数を識別しやすく保持
+            h_val: msg.h_val,
+            s_val: msg.s_val,
+            v_val: msg.v_val,
+            image_data: msg.image_data,
+            type: msg.type,
+            wavelengths: msg.wavelengths || [],
+            intensities: msg.intensities || []
+        };
+    });
+    updateUI(); 
+});
+
+        socket.on('load one message', (msg) => { 
+    // 新しく届いたデータを、過去ログと同じ形式（_id）に整えて配列の先頭（最新位置）に追加するぜッ！
+    allData.unshift({
+        _id: msg.id, 
+        project_name: msg.project_name,
+        material_name: msg.material_name,
+        message: msg.message,
+        h_val: msg.h_val,
+        s_val: msg.s_val,
+        v_val: msg.v_val,
+        image_data: msg.image_data,
+        type: msg.type,
+        wavelengths: msg.wavelengths || [],
+        intensities: msg.intensities || []
+    });
+    updateUI(); 
+});
 
         socket.on('message deleted', (data) => {
             allData = allData.filter(d => d._id !== data.id);
             updateUI();
         });
 
-        function deleteMsg(id) {
-            if (confirm("このデータを削除してもいいんだな？ 覚悟はいいか？")) {
+        function deleteMsg(id, event) {
+            // カードクリックイベントとバッティングしてグラフが開かないようにガード
+            if (event) event.stopPropagation();
+            if (confirm("このデータを完全に削除してもよろしいですか？")) {
                 socket.emit('delete message', { id: id });
             }
         }
 
-        // --- UI更新処理 ---
+        // 📈 モーダルを開いてChart.jsでグラフを描画する超重要関数だッ！
+        function openGraph(id) {
+            const target = allData.find(d => d._id === id);
+            if (!target || !target.wavelengths || target.wavelengths.length === 0) {
+                return; // 分光データが空なら何もしない
+            }
+
+            document.getElementById('modalTitle').innerText = ` 分光スペクトル: ${target.material_name} (${target.project_name})`;
+            document.getElementById('graphModal').classList.add('active');
+
+            const ctx = document.getElementById('spectrumChart').getContext('2d');
+            
+            // 既存のグラフがあれば一度破棄（バグ防止）
+            if (myChart) { myChart.destroy(); }
+
+            // Chart.jsで散布図/折れ線グラフを生成
+            myChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: target.wavelengths, // X軸：波長
+                    datasets: [{
+                        label: '光度スペクトル(Intensity)',
+                        data: target.intensities, // Y軸：光度
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.05)',
+                        borderWidth: 2,
+                        pointRadius: 0, // マーカーを非表示にしてスムーズな線にする
+                        fill: true,
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { title: { display: true, text: 'Wavelength (nm)' } },
+                        y: { title: { display: true, text: 'Intensity' } }
+                    }
+                }
+            });
+        }
+
+        function closeModal() {
+            document.getElementById('graphModal').classList.remove('active');
+        }
+
         function updateUI() {
             const display = document.getElementById('display');
             if (!display) return;
@@ -160,17 +519,47 @@
                 filteredData = [...filteredData].reverse();
             }
 
-            display.innerHTML = filteredData.map(msg => `
-                <div class="card message-card" id="msg-${msg._id}">
-                    <button class="delete-btn" onclick="deleteMsg('${msg._id}')">×</button>
-                    <img src="${msg.image_data}" alt="Material Image">
-                    <div>
-                        <span class="badge">${msg.project_name || '未分類'}</span>
-                        <span class="badge" style="background:#27ae60;">${msg.material_name || '名称不明'}</span>
-                        <p style="margin:5px 0; font-size:0.9em;">${msg.message || '(メモなし)'}</p>
-                    </div>
-                </div>
-            `).join('');
+            display.innerHTML = filteredData.map(msg => {
+                if (msg.image_data) {
+                    return `
+                        <div class="card message-card" id="msg-${msg._id}">
+                            <button class="delete-btn" onclick="deleteMsg('${msg._id}', event)">×</button>
+                            <img src="${msg.image_data}" alt="Material Image">
+                            <div>
+                                <div class="badge-wrapper">
+                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${msg.project_name || '未分類'}</span>
+                                    <span class="badge" style="background:#dcfce7; color:#15803d;">${msg.material_name || '名称不明'}</span>
+                                </div>
+                                <p style="margin:5px 0; font-weight:bold; color:var(--accent); font-size:0.95em;">
+                                     HSV解析結果: <span style="color:var(--text-main); font-weight:500;">H:${msg.h_val} / S:${msg.s_val} / V:${msg.v_val}</span>
+                                </p>
+                                <p style="margin:5px 0; font-size:0.9em; color:#64748b;">${msg.message || '(条件メモなし)'}</p>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // CSV（波長・光度）データ専用のクリーンなカードUIに変形だッ！
+                    const dataCount = msg.wavelengths ? msg.wavelengths.length : 0;
+                    return `
+                        <div class="card message-card csv-card" id="msg-${msg._id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" onclick="openGraph('${msg._id}')">
+                            <button class="delete-btn" onclick="deleteMsg('${msg._id}', event)">×</button>
+                            <div style="width: 100px; height: 75px; background: #8e44ad; color: white; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: bold; font-size: 0.8em; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); line-height: 1.3;">
+                                SPECTRA<br>ANALYSIS
+                            </div>
+                            <div>
+                                <div class="badge-wrapper">
+                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${msg.project_name || '未分類'}</span>
+                                    <span class="badge" style="background:#f3e8ff; color:#6b21a8;">${msg.material_name || '名称不明'}</span>
+                                </div>
+                                <p style="margin:5px 0; font-weight:bold; color:#8e44ad; font-size:0.95em;">
+                                     分光データ解析結果: <span style="color:var(--text-main); font-weight:500;">波長-光度データ (${dataCount} 点)</span>
+                                </p>
+                                <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> クリックして波長スペクトルグラフを表示</p>
+                            </div>
+                        </div>
+                    `;
+                }
+            }).join('');
         }
 
         function updateProjectList() {
@@ -178,7 +567,9 @@
             const projects = ['すべて', ...new Set(allData.map(d => d.project_name || '未分類'))];
             
             listDiv.innerHTML = projects.map(p => 
-                `<button class="project-btn ${currentProject === p ? 'active' : ''}" onclick="filterProject('${p}')">${p}</button>`
+                `<button class="project-btn ${currentProject === p ? 'active' : ''}" onclick="filterProject('${p}')">
+                    <span>📁 ${p}</span>
+                </button>`
             ).join('');
         }
 
@@ -187,8 +578,17 @@
             updateUI();
         }
 
+        function downloadCSV() {
+            location.href = `/download_csv?project=${encodeURIComponent(currentProject)}`;
+        }
+
+        function downloadExcel() {
+            location.href = `/download_excel?project=${encodeURIComponent(currentProject)}`;
+        }
+
         document.getElementById('sort_btn').onclick = () => { 
             isNewest = !isNewest; 
+            document.getElementById('sort_btn').innerText = isNewest ? "古い順" : "新しい順";
             updateUI(); 
         };
     </script>
