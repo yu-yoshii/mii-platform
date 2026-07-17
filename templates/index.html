@@ -3,7 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <title>MI Project Manager</title>
-    <!-- Socket.IO と グラフ用ライブラリ Chart.js を読み込みだッ！ -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -87,7 +86,7 @@
             color: #64748b;
             margin-bottom: 6px;
         }
-        input[type="text"], input[type="file"] { 
+        input[type="text"], input[type="file"], select { 
             width: 100%; 
             padding: 10px 14px; 
             border-radius: var(--radius); 
@@ -97,7 +96,7 @@
             transition: all 0.2s;
             background: #f8fafc;
         }
-        input[type="text"]:focus {
+        input[type="text"]:focus, select:focus {
             outline: none;
             border-color: var(--primary);
             background: #fff;
@@ -159,7 +158,6 @@
             box-shadow: 0 10px 15px -3px rgba(0,0,0,0.08);
         }
         
-        /* 分光カードを目立たせ、クリックできる雰囲気（ポインター）を出す */
         .csv-card {
             cursor: pointer;
         }
@@ -224,7 +222,6 @@
         }
         .download-flex button { font-size: 0.85em; padding: 10px; }
 
-        /* 📊 グラフポップアップ（モーダルウインドウ）のCSS */
         .modal-overlay {
             position: fixed;
             top: 0; left: 0; width: 100%; height: 100%;
@@ -261,6 +258,12 @@
             display: flex; align-items: center; justify-content: center;
         }
         .modal-close:hover { background: #e2e8f0; color: #334155; }
+
+        /* 💡 追加：その他を選んだ時の自由入力エリア用スタイル */
+        .custom-input-box {
+            margin-top: 8px;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -289,20 +292,49 @@
 
         <div style="margin: 30px 0; border-top: 2px dashed var(--border);"></div>
 
-        <h3>📈 分光CSVデータ送信</h3>
+        <h3>📈 汎用実験CSVデータ送信</h3>
         <div class="input-group">
             <label>実験名 (プロジェクト名)</label>
             <input type="text" id="csv_project_name" placeholder="例: 実験1">
         </div>
         <div class="input-group">
             <label>試料名 (マテリアル)</label>
-            <input type="text" id="csv_material_name" placeholder="例: サンプルA(分光)">
+            <input type="text" id="csv_material_name" placeholder="例: サンプルA(物性)">
         </div>
+
+        <div class="input-group">
+            <label>X軸のデータ種類 (1列目)</label>
+            <select id="x_preset" onchange="toggleCustomInput('x')">
+                <option value="Wavelength (nm)">波長 (nm)</option>
+                <option value="Voltage (V)">電流 (mA)</option>
+                <option value="Temperature (℃)">温度 (℃)</option>
+                <option value="Time (sec)">時間 (sec)</option>
+                <option value="custom">その他 (自分で入力)</option>
+            </select>
+            <div id="x_custom_div" class="custom-input-box">
+                <input type="text" id="x_custom_val" placeholder="例: 磁場 (T)">
+            </div>
+        </div>
+
+        <div class="input-group">
+            <label>Y軸のデータ種類 (2列目)</label>
+            <select id="y_preset" onchange="toggleCustomInput('y')">
+                <option value="Intensity">光度 (Intensity)</option>
+                <option value="Current (mA)">電圧 (V)</option>
+                <option value="Absorbance">吸光度 (Absorbance)</option>
+                <option value="Weight (mg)">重量 (mg)</option>
+                <option value="custom">その他 (自分で入力)</option>
+            </select>
+            <div id="y_custom_div" class="custom-input-box">
+                <input type="text" id="y_custom_val" placeholder="例: 抵抗 (Ω)">
+            </div>
+        </div>
+
         <div class="input-group">
             <label>CSVファイル (.csv)</label>
             <input type="file" id="csv_file" accept=".csv">
         </div>
-        <button class="btn-primary" onclick="sendCSV()">分光データを保存</button>
+        <button class="btn-primary" onclick="sendCSV()">実験データを保存</button>
         
         <div class="download-zone">
             <label style="font-size: 0.85em; font-weight: 600; color: #64748b; display:block; margin-bottom:5px;">データエクスポート</label>
@@ -328,11 +360,10 @@
         <div id="display"></div>
     </div>
 
-    <!-- 📊 グラフ表示用のモーダルポップアップのHTML構造だッ！ -->
     <div class="modal-overlay" id="graphModal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeModal()">×</button>
-            <h3 id="modalTitle" style="margin-bottom:15px; color:#2980b9;">分光スペクトル確認</h3>
+            <h3 id="modalTitle" style="margin-bottom:15px; color:#2980b9;">実験データグラフ確認</h3>
             <div style="width: 100%; height: 350px;">
                 <canvas id="spectrumChart"></canvas>
             </div>
@@ -344,7 +375,18 @@
         let allData = [];
         let currentProject = 'すべて';
         let isNewest = false;
-        let myChart = null; // グラフのインスタンス管理用
+        let myChart = null; 
+
+        // 💡 追加：「その他」を選んだ時に自由入力欄を出し入れする関数
+        function toggleCustomInput(axis) {
+            const preset = document.getElementById(`${axis}_preset`).value;
+            const customDiv = document.getElementById(`${axis}_custom_div`);
+            if (preset === 'custom') {
+                customDiv.style.display = 'block';
+            } else {
+                customDiv.style.display = 'none';
+            }
+        }
 
         socket.on('connect', () => {
             document.getElementById('status').innerText = "● 接続完了";
@@ -388,6 +430,16 @@
             const fileInput = document.getElementById('csv_file');
             
             if (fileInput.files.length === 0) return alert("CSVファイルを選択してください");
+
+            // 💡 改造：X軸とY軸のラベル値を確定させる
+            let xLabel = document.getElementById('x_preset').value;
+            if (xLabel === 'custom') {
+                xLabel = document.getElementById('x_custom_val').value || 'X軸データ';
+            }
+            let yLabel = document.getElementById('y_preset').value;
+            if (yLabel === 'custom') {
+                yLabel = document.getElementById('y_custom_val').value || 'Y軸データ';
+            }
             
             const file = fileInput.files[0];
             const reader = new FileReader();
@@ -395,56 +447,71 @@
             reader.onload = function(e) {
                 const text = e.target.result;
                 
+                // 💡 改造：引数に x_label, y_label をブレンドして送信
                 socket.emit('send csv data', {
                     project_name: projInput.value || '未分類',
                     material_name: matInput.value || '名称不明',
-                    csv_text: text
+                    csv_text: text,
+                    x_label: xLabel,
+                    y_label: yLabel
                 });
                 
                 fileInput.value = '';
-                alert("分光CSVデータをサーバーに送信しました");
+                // 入力欄もリセット
+                document.getElementById('x_custom_val').value = '';
+                document.getElementById('y_custom_val').value = '';
+                document.getElementById('x_preset').value = 'Wavelength (nm)';
+                document.getElementById('y_preset').value = 'Intensity';
+                toggleCustomInput('x');
+                toggleCustomInput('y');
+                
+                alert("実験CSVデータをサーバーに送信しました");
             };
             
             reader.readAsText(file);
         }
 
         socket.on('load all messages', function(messages) {
-    allData = messages.map(msg => {
-        return {
-            _id: msg.id, 
-            project_name: msg.project_name,
-            material_name: msg.material_name,
-            message: msg.message,
-            // 画像なら色相・彩度・明度、CSVなら波長・光度のデータ点数を識別しやすく保持
-            h_val: msg.h_val,
-            s_val: msg.s_val,
-            v_val: msg.v_val,
-            image_data: msg.image_data,
-            type: msg.type,
-            wavelengths: msg.wavelengths || [],
-            intensities: msg.intensities || []
-        };
-    });
-    updateUI(); 
-});
+            allData = messages.map(msg => {
+                return {
+                    _id: msg.id, 
+                    project_name: msg.project_name,
+                    material_name: msg.material_name,
+                    message: msg.message,
+                    h_val: msg.h_val,
+                    s_val: msg.s_val,
+                    v_val: msg.v_val,
+                    image_data: msg.image_data,
+                    type: msg.type,
+                    // 💡 改造：wavelengths/intensities という名前から、汎用的な x_values/y_values に対応させる（Python側の互換性も考慮）
+                    x_label: msg.x_label || 'Wavelength (nm)',
+                    y_label: msg.y_label || 'Intensity',
+                    x_values: msg.x_values || msg.wavelengths || [],
+                    y_values: msg.y_values || msg.intensities || []
+                };
+            });
+            updateUI(); 
+        });
 
         socket.on('load one message', (msg) => { 
-    // 新しく届いたデータを、過去ログと同じ形式（_id）に整えて配列の先頭（最新位置）に追加するぜッ！
-    allData.unshift({
-        _id: msg.id, 
-        project_name: msg.project_name,
-        material_name: msg.material_name,
-        message: msg.message,
-        h_val: msg.h_val,
-        s_val: msg.s_val,
-        v_val: msg.v_val,
-        image_data: msg.image_data,
-        type: msg.type,
-        wavelengths: msg.wavelengths || [],
-        intensities: msg.intensities || []
-    });
-    updateUI(); 
-});
+            allData.unshift({
+                _id: msg.id, 
+                project_name: msg.project_name,
+                material_name: msg.material_name,
+                message: msg.message,
+                h_val: msg.h_val,
+                s_val: msg.s_val,
+                v_val: msg.v_val,
+                image_data: msg.image_data,
+                type: msg.type,
+                // 💡 リアルタイム受信時も汎用名で受け取る
+                x_label: msg.x_label || 'Wavelength (nm)',
+                y_label: msg.y_label || 'Intensity',
+                x_values: msg.x_values || msg.wavelengths || [],
+                y_values: msg.y_values || msg.intensities || []
+            });
+            updateUI(); 
+        });
 
         socket.on('message deleted', (data) => {
             allData = allData.filter(d => d._id !== data.id);
@@ -452,40 +519,36 @@
         });
 
         function deleteMsg(id, event) {
-            // カードクリックイベントとバッティングしてグラフが開かないようにガード
             if (event) event.stopPropagation();
             if (confirm("このデータを完全に削除してもよろしいですか？")) {
                 socket.emit('delete message', { id: id });
             }
         }
 
-        // 📈 モーダルを開いてChart.jsでグラフを描画する超重要関数だッ！
         function openGraph(id) {
             const target = allData.find(d => d._id === id);
-            if (!target || !target.wavelengths || target.wavelengths.length === 0) {
-                return; // 分光データが空なら何もしない
+            if (!target || !target.x_values || target.x_values.length === 0) {
+                return; 
             }
 
-            document.getElementById('modalTitle').innerText = ` 分光スペクトル: ${target.material_name} (${target.project_name})`;
+            // 💡 改造：タイトルと軸の文字を、保存された変数名に動的チェンジ
+            document.getElementById('modalTitle').innerText = `データプロット: ${target.material_name} (${target.project_name})`;
             document.getElementById('graphModal').classList.add('active');
 
             const ctx = document.getElementById('spectrumChart').getContext('2d');
-            
-            // 既存のグラフがあれば一度破棄（バグ防止）
             if (myChart) { myChart.destroy(); }
 
-            // Chart.jsで散布図/折れ線グラフを生成
             myChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: target.wavelengths, // X軸：波長
+                    labels: target.x_values, // 💡 X軸の値
                     datasets: [{
-                        label: '光度スペクトル(Intensity)',
-                        data: target.intensities, // Y軸：光度
-                        borderColor: '#3b82f6',
-                        backgroundColor: 'rgba(59, 130, 246, 0.05)',
+                        label: `${target.y_label} vs ${target.x_label}`, // 💡 動的な凡例
+                        data: target.y_values, // 💡 Y軸の値
+                        borderColor: '#8e44ad', 
+                        backgroundColor: 'rgba(142, 68, 173, 0.05)',
                         borderWidth: 2,
-                        pointRadius: 0, // マーカーを非表示にしてスムーズな線にする
+                        pointRadius: target.x_values.length > 300 ? 0 : 2, // データ数が多すぎるときは線を滑らかに、少なければ点を打つ
                         fill: true,
                         tension: 0.1
                     }]
@@ -494,8 +557,8 @@
                     responsive: true,
                     maintainAspectRatio: false,
                     scales: {
-                        x: { title: { display: true, text: 'Wavelength (nm)' } },
-                        y: { title: { display: true, text: 'Intensity' } }
+                        x: { title: { display: true, text: target.x_label } }, // 💡 X軸のラベルを自動変更
+                        y: { title: { display: true, text: target.y_label } }  // 💡 Y軸のラベルを自動変更
                     }
                 }
             });
@@ -538,13 +601,12 @@
                         </div>
                     `;
                 } else {
-                    // CSV（波長・光度）データ専用のクリーンなカードUIに変形だッ！
-                    const dataCount = msg.wavelengths ? msg.wavelengths.length : 0;
+                    const dataCount = msg.x_values ? msg.x_values.length : 0;
                     return `
                         <div class="card message-card csv-card" id="msg-${msg._id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" onclick="openGraph('${msg._id}')">
                             <button class="delete-btn" onclick="deleteMsg('${msg._id}', event)">×</button>
-                            <div style="width: 100px; height: 75px; background: #8e44ad; color: white; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: bold; font-size: 0.8em; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); line-height: 1.3;">
-                                SPECTRA<br>ANALYSIS
+                            <div style="width: 100px; height: 75px; background: #8e44ad; color: white; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: bold; font-size: 0.75em; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); line-height: 1.3;">
+                                DATA<br>PLOTTER
                             </div>
                             <div>
                                 <div class="badge-wrapper">
@@ -552,9 +614,9 @@
                                     <span class="badge" style="background:#f3e8ff; color:#6b21a8;">${msg.material_name || '名称不明'}</span>
                                 </div>
                                 <p style="margin:5px 0; font-weight:bold; color:#8e44ad; font-size:0.95em;">
-                                     分光データ解析結果: <span style="color:var(--text-main); font-weight:500;">波長-光度データ (${dataCount} 点)</span>
+                                     解析データ: <span style="color:var(--text-main); font-weight:500;">${msg.x_label} - ${msg.y_label} (${dataCount} 点)</span>
                                 </p>
-                                <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> クリックして波長スペクトルグラフを表示</p>
+                                <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> クリックして相関データグラフを表示</p>
                             </div>
                         </div>
                     `;
