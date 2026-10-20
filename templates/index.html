@@ -6,6 +6,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        /*画面のデザイン、レイアウト*/
+        
         :root {
             --bg-main: #f8fafc;
             --bg-panel: #ffffff;
@@ -531,7 +533,7 @@
                 return; 
             }
 
-            // 💡 改造：タイトルと軸の文字を、保存された変数名に動的チェンジ
+            // 改造：タイトルと軸の文字を、保存された変数名に動的チェンジ
             document.getElementById('modalTitle').innerText = `データプロット: ${target.material_name} (${target.project_name})`;
             document.getElementById('graphModal').classList.add('active');
 
