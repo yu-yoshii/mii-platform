@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>MI AI Prediction Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-main: #f8fafc;
+            --bg-panel: #ffffff;
+            --text-main: #334155;
+            --primary: #3b82f6;
+            --border: #e2e8f0;
+            --radius: 12px;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-main);
+            margin: 0;
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 900px;
+            background: var(--bg-panel);
+            padding: 30px;
+            border-radius: var(--radius);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            box-sizing: border-box;
+        }
+        h2 { margin-top: 0; color: #1e293b; display: flex; align-items: center; gap: 10px; }
+        .control-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .input-box label {
+            display: block;
+            font-size: 0.85em;
+            font-weight: 600;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+        .input-box input {
+            width: 100%;
+            padding: 10px 14px;
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            box-sizing: border-box;
+            font-size: 0.95em;
+        }
+        .btn-predict {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: var(--radius);
+            font-weight: bold;
+            font-size: 1em;
+            cursor: pointer;
+            width: 100%;
+            transition: background 0.2s;
+        }
+        .btn-predict:hover { background-color: #2563eb; }
+        .nav-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+        .nav-link:hover { text-decoration: underline; }
+        .chart-container {
+            position: relative;
+            height: 450px;
+            width: 100%;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <a href="/" class="nav-link">← データ管理画面（データ収集・一覧）へ戻る</a>
+        
+        <h2>📊 ガウス過程回帰 (GPR) AI 予測シミュレーター</h2>
+        <p style="color: #64748b; font-size: 0.95em; margin-bottom: 25px;">
+            蓄積された実験データからガウス過程モデルで学習し、任意の実験条件における未来の挙動と不確実性（95%信頼区間）をシミュレーションします。
+        </p>
+
+        <div class="control-group">
+            <div class="input-box">
+                <label>温度 (℃)</label>
+                <input type="number" id="predTemp" value="25.0" step="0.1">
+            </div>
+            <div class="input-box">
+                <label>物質A量 (g)</label>
+                <input type="number" id="predMatA" value="1.5" step="0.1">
+            </div>
+            <div class="input-box">
+                <label>物質B量 (g)</label>
+                <input type="number" id="predMatB" value="0.5" step="0.1">
+            </div>
+        </div>
+
+        <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()">🚀 AI予測シミュレーションを実行</button>
+
+        <div class="chart-container">
+            <canvas id="predictionChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        let predictionChartInstance = null;
+
+        async function runPrediction() {
+            const temperature = parseFloat(document.getElementById('predTemp').value);
+            const material_a = parseFloat(document.getElementById('predMatA').value);
+            const material_b = parseFloat(document.getElementById('predMatB').value);
+
+            const btn = document.getElementById('runPredictBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ ガウス過程による回帰計算中...';
+
+            try {
+                // 予測専用APIへPOSTリクエスト
+                const response = await fetch('/api/predict_dynamic', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ temperature, material_a, material_b })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    renderPredictionChart(result);
+                } else {
+                    alert('予測エラー: ' + (result.error || '不明なエラー'));
+                }
+            } catch (err) {
+                console.error(err);
+                alert('サーバーとの通信に失敗しました。');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🚀 AI予測シミュレーションを実行';
+            }
+        }
+
+        function renderPredictionChart(data) {
+            const ctx = document.getElementById('predictionChart').getContext('2d');
+
+            if (predictionChartInstance) {
+                predictionChartInstance.destroy();
+            }
+
+            const times = data.times;
+            const predictions = data.predictions;
+            const high = data.confidence_high;
+            const low = data.confidence_low;
+            const cond = data.target_conditions;
+
+            predictionChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: times.map(t => t.toFixed(1)),
+                    datasets: [
+                        {
+                            label: `予測平均 (Temp:${cond.temperature}℃, A:${cond.material_a}g, B:${cond.material_b}g)`,
+                            data: predictions,
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'rgba(59, 130, 246, 0.05)',
+                            borderWidth: 2.5,
+                            pointRadius: 0,
+                            tension: 0.2
+                        },
+                        {
+                            label: '95% 信頼区間 上限',
+                            data: high,
+                            borderColor: 'rgba(59, 130, 246, 0.3)',
+                            borderWidth: 1,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                            fill: false
+                        },
+                        {
+                            label: '95% 信頼区間 下限',
+                            data: low,
+                            borderColor: 'rgba(59, 130, 246, 0.3)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.12)', // 信頼区間の帯を色塗り
+                            borderWidth: 1,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                            fill: '-1' // 1つ前のデータセット（上限）と繋いで帯にする
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Gaussian Process Regression (GPR) Prediction with Confidence Intervals',
+                            font: { size: 14 }
+                        }
+                    },
+                    scales: {
+                        x: { title: { display: true, text: 'Time / X Axis' } },
+                        y: { title: { display: true, text: 'Predicted Response (y)' } }
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>
