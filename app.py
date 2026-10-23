@@ -406,6 +406,11 @@ def download_excel():
     except Exception as e:
         traceback.print_exc()
         return "Excel生成エラー", 500
+# 💡 サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
+model_cache = {
+    "latest_id": None,
+    "gp_model": None
+}
 
 @app.route("/api/predict_dynamic", methods=["POST"])
 def predict_dynamic():
@@ -415,48 +420,60 @@ def predict_dynamic():
         target_mat_a = float(req_data.get("material_a", 1.5))
         target_mat_b = float(req_data.get("material_b", 0.5))
 
-        # 負荷軽減のため、最新の実験データを1件取得して学習元とする
+        # 1. データベースから最新の実験データを特定するためのIDを取得
         latest_spec = db.spectrums.find_one(sort=[('_id', -1)])
         if not latest_spec:
             return {"error": "データベースに学習元のCSVデータがありません。"}, 400
 
+        spec_id = str(latest_spec['_id'])
         x_vals = latest_spec.get('x_values', [])
         y_vals = latest_spec.get('y_values', [])
 
         if len(x_vals) < 5:
             return {"error": "学習させるためのデータ点が足りません(最低5点以上必要です)。"}, 400
 
-        # 💡 【軽量化対策】データ点が多すぎる場合、最大100点に間引いて計算爆発を防ぐ
-        max_points = 100
-        if len(x_vals) > max_points:
-            step = len(x_vals) // max_points
-            x_vals = x_vals[::step]
-            y_vals = y_vals[::step]
+        # 2. 【キャッシュ判定】データが新しくなった、またはまだ学習していない場合のみフィット（再学習）を行う
+        if model_cache["latest_id"] != spec_id or model_cache["gp_model"] is None:
+            print("🔄 新しい実験データを検知しました。GPRモデルを学習・キャッシュします...")
+            
+            # 💡 解像度を担保するため、最大点数を 250点 に設定
+            max_points = 250
+            if len(x_vals) > max_points:
+                step = len(x_vals) // max_points
+                x_vals = x_vals[::step]
+                y_vals = y_vals[::step]
 
-        temp = float(latest_spec.get('temperature', 25.0))
-        mat_a = float(latest_spec.get('material_a', 1.5))
-        mat_b = float(latest_spec.get('material_b', 0.5))
+            temp = float(latest_spec.get('temperature', 25.0))
+            mat_a = float(latest_spec.get('material_a', 1.5))
+            mat_b = float(latest_spec.get('material_b', 1.5))
 
-        X_train = []
-        y_train = []
+            X_train = []
+            y_train = []
+            for t, val in zip(x_vals, y_vals):
+                X_train.append([t, temp, mat_a, mat_b])
+                y_train.append(val)
+
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+
+            # ガウス過程回帰の構築と学習（n_restarts_optimizer=1で高速化）
+            kernel = C(1.0, (1e-3, 1e3)) * RBF([1.0, 10.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(noise_level=0.1)
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=1, alpha=1e-6)
+            
+            gp.fit(X_train, y_train)
+
+            # メモリ上に保存
+            model_cache["latest_id"] = spec_id
+            model_cache["gp_model"] = gp
+        else:
+            print("⚡ キャッシュされたGPRモデルを使用します（爆速）")
+
+        # 3. 予測フェーズ（学習済みモデルを使って一瞬で計算）
+        gp = model_cache["gp_model"]
         max_time = max(x_vals) if x_vals else 100
-
-        for t, val in zip(x_vals, y_vals):
-            X_train.append([t, temp, mat_a, mat_b])
-            y_train.append(val)
-
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
-
-        # 💡 カーネル設定（n_restarts_optimizerを1に下げて計算を高速化）
-        kernel = C(1.0, (1e-3, 1e3)) * RBF([1.0, 10.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(noise_level=0.1)
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=1, alpha=1e-6)
-        
-        gp.fit(X_train, y_train)
-
         predict_times = np.linspace(0, max_time, 100)
+        
         X_predict = np.array([[pt, target_temp, target_mat_a, target_mat_b] for pt in predict_times])
-
         y_pred, y_std = gp.predict(X_predict, return_std=True)
 
         response_data = {
