@@ -89,7 +89,7 @@
     <div class="container">
         <a href="/" class="nav-link">← データ管理画面（データ収集・一覧）へ戻る</a>
         
-        <h2>📊 ガウス過程回帰 (GPR) AI 予測シミュレーター</h2>
+        <h2> ガウス過程回帰 (GPR)  予測シミュレーター</h2>
         <p style="color: #64748b; font-size: 0.95em; margin-bottom: 25px;">
             蓄積された実験データからガウス過程モデルで学習し、任意の実験条件における未来の挙動と不確実性（95%信頼区間）をシミュレーションします。
         </p>
@@ -109,7 +109,7 @@
             </div>
         </div>
 
-        <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()">🚀 AI予測シミュレーションを実行</button>
+        <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()"> 予測シミュレーションを実行</button>
 
         <div class="chart-container">
             <canvas id="predictionChart"></canvas>
@@ -126,7 +126,7 @@
 
             const btn = document.getElementById('runPredictBtn');
             btn.disabled = true;
-            btn.textContent = '⏳ ガウス過程による回帰計算中...';
+            btn.textContent = ' ガウス過程による回帰計算中...';
 
             try {
                 // 予測専用APIへPOSTリクエスト
@@ -148,7 +148,7 @@
                 alert('サーバーとの通信に失敗しました。');
             } finally {
                 btn.disabled = false;
-                btn.textContent = '🚀 AI予測シミュレーションを実行';
+                btn.textContent = ' 予測シミュレーションを実行';
             }
         }
 
