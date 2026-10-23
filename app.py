@@ -415,6 +415,7 @@ def predict_dynamic():
         target_mat_a = float(req_data.get("material_a", 1.5))
         target_mat_b = float(req_data.get("material_b", 0.5))
 
+        # 負荷軽減のため、最新の実験データを1件取得して学習元とする
         latest_spec = db.spectrums.find_one(sort=[('_id', -1)])
         if not latest_spec:
             return {"error": "データベースに学習元のCSVデータがありません。"}, 400
@@ -425,27 +426,36 @@ def predict_dynamic():
         if len(x_vals) < 5:
             return {"error": "学習させるためのデータ点が足りません(最低5点以上必要です)。"}, 400
 
+        # 💡 【軽量化対策】データ点が多すぎる場合、最大100点に間引いて計算爆発を防ぐ
+        max_points = 100
+        if len(x_vals) > max_points:
+            step = len(x_vals) // max_points
+            x_vals = x_vals[::step]
+            y_vals = y_vals[::step]
+
+        temp = float(latest_spec.get('temperature', 25.0))
+        mat_a = float(latest_spec.get('material_a', 1.5))
+        mat_b = float(latest_spec.get('material_b', 0.5))
+
         X_train = []
         y_train = []
+        max_time = max(x_vals) if x_vals else 100
+
         for t, val in zip(x_vals, y_vals):
-            X_train.append([t, 25.0, 1.5, 0.5]) 
+            X_train.append([t, temp, mat_a, mat_b])
             y_train.append(val)
 
         X_train = np.array(X_train)
         y_train = np.array(y_train)
 
+        # 💡 カーネル設定（n_restarts_optimizerを1に下げて計算を高速化）
         kernel = C(1.0, (1e-3, 1e3)) * RBF([1.0, 10.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(noise_level=0.1)
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, alpha=0.0)
-
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=1, alpha=1e-6)
+        
         gp.fit(X_train, y_train)
 
-        max_time = max(x_vals)
         predict_times = np.linspace(0, max_time, 100)
-        
-        X_predict = []
-        for pt in predict_times:
-            X_predict.append([pt, target_temp, target_mat_a, target_mat_b])
-        X_predict = np.array(X_predict)
+        X_predict = np.array([[pt, target_temp, target_mat_a, target_mat_b] for pt in predict_times])
 
         y_pred, y_std = gp.predict(X_predict, return_std=True)
 
@@ -465,6 +475,5 @@ def predict_dynamic():
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}, 500
-
 if __name__ == "__main__":
     socketio.run(app, debug=True, host="0.0.0.0", port=5000)
