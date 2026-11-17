@@ -48,7 +48,7 @@ db = client["SNS"]
 fs = gridfs.GridFS(db)
 
 # =============================================================
-# 🌐 画面遷移ルーティング設定
+#  画面遷移ルーティング設定
 # =============================================================
 
 @app.route("/")
@@ -132,7 +132,7 @@ def get_image_data(image_id):
         return ""
 
 # =============================================================
-# 📥 Socket.IO 通信イベント群
+#  Socket.IO 通信イベント群
 # =============================================================
 
 @socketio.on('load messages')
@@ -347,7 +347,7 @@ def delete_message(data):
         traceback.print_exc()
 
 # =============================================================
-# 💾 HTTPルート群（項目別ダウンロード＆エクセル自動グラフ化）
+#  HTTPルート群（項目別ダウンロード＆エクセル自動グラフ化）
 # =============================================================
 
 @app.route("/download_csv")
@@ -502,7 +502,7 @@ def download_excel():
     except Exception as e:
         traceback.print_exc()
         return "Excel生成エラー", 500
-# 💡 サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
+#  サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
 model_cache = {
     "cache_key": None,
     "gp_model": None
@@ -566,7 +566,7 @@ def predict_dynamic():
         else:
             print("⚡ キャッシュされたGPRモデルを使用します")
 
-        # 3. 予測フェーズ（学習済みモデルを使って一瞬で計算）
+        # 予測フェーズ（学習済みモデルを使って一瞬で計算）
         gp = model_cache["gp_model"]
         predict_times = np.linspace(min(x_vals), max(x_vals), 100)
         
