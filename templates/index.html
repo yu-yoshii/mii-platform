@@ -311,6 +311,13 @@
             <input type="text" id="csv_domain" placeholder="例: MI、EMC、光学">
         </div>
         <div class="input-group">
+            <label>実験セット名（同じ実験のCSVには同じ名前）</label>
+            <input type="text" id="csv_experiment_name" placeholder="例: RC回路の応答測定" oninput="updateCsvRoleValidity()">
+            <small style="display:block; color:#64748b; margin-top:5px;">
+                同じプロジェクト・試料・分野・セット名のCSVをまとめて学習します。
+            </small>
+        </div>
+        <div class="input-group">
             <label>CSVファイル（1行目は列名、以降は測定値）</label>
             <input type="file" id="csv_file" accept=".csv,text/csv" onchange="previewCSV()">
         </div>
@@ -363,6 +370,7 @@
         let currentProject = 'すべて';
         let isNewest = false;
         let myChart = null; 
+        const previousColumnRoles = new Map();
 
         socket.on('connect', () => {
             document.getElementById('status').innerText = "● 接続完了";
@@ -435,7 +443,11 @@
                         ['input', '条件（入力）'],
                         ['target', '結果（予測）']
                     ].forEach(([value, text]) => select.add(new Option(text, value)));
-                    select.addEventListener('change', updateCsvRoleValidity);
+                    select.value = previousColumnRoles.get(column) || 'ignore';
+                    select.addEventListener('change', () => {
+                        previousColumnRoles.set(column, select.value);
+                        updateCsvRoleValidity();
+                    });
                     row.append(label, select);
                     roleContainer.append(row);
                 });
@@ -468,6 +480,7 @@
             const targetCount = roles.filter(select => select.value === 'target').length;
             document.getElementById('save_csv_button').disabled =
                 document.getElementById('csv_file').files.length === 0 ||
+                !document.getElementById('csv_experiment_name').value.trim() ||
                 inputCount === 0 ||
                 targetCount === 0;
         }
@@ -476,8 +489,10 @@
             const projInput = document.getElementById('csv_project_name');
             const matInput = document.getElementById('csv_material_name');
             const fileInput = document.getElementById('csv_file');
+            const experimentName = document.getElementById('csv_experiment_name').value.trim();
 
             if (fileInput.files.length === 0) return alert("CSVファイルを選択してください");
+            if (!experimentName) return alert("実験セット名を入力してください。");
 
             const roles = [...document.querySelectorAll('#csv_column_roles select')];
             const inputColumns = roles.filter(select => select.value === 'input').map(select => select.dataset.column);
@@ -491,6 +506,7 @@
             formData.append('project_name', projInput.value || '未分類');
             formData.append('material_name', matInput.value || '名称不明');
             formData.append('domain', document.getElementById('csv_domain').value || '未分類');
+            formData.append('experiment_name', experimentName);
             formData.append('input_columns', JSON.stringify(inputColumns));
             formData.append('target_columns', JSON.stringify(targetColumns));
 
@@ -504,7 +520,10 @@
                 socket.emit('load messages');
                 fileInput.value = '';
                 document.getElementById('csv_role_editor').style.display = 'none';
-                alert(`${result.row_count}行の実験データを保存しました。`);
+                alert(
+                    `${result.added_row_count}行を追加しました。` +
+                    `セット合計: ${result.row_count}行 / ${result.run_count}件のCSV`
+                );
             } catch (error) {
                 alert(error.message);
             } finally {
