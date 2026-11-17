@@ -25,6 +25,7 @@ import csv
 import os
 import tempfile
 from pathlib import Path
+import json
 # CSVファイルをメモリ上で読み書きするための道具
 
 # エクセル生成と自動グラフ化用のライブラリ
@@ -34,10 +35,12 @@ from openpyxl.chart import ScatterChart, Series, Reference
 # プログラムから綺麗なエクセルファイルを制作したりグラフを自動で書かせたりするための道具
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from sklearn.preprocessing import StandardScaler
 # 機械学習の機能、ガウス過程回帰を読み出している
 
 app = Flask(__name__)
 # Flask（）でウェブアプリの仕組みを実体化している
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20000000)
 
@@ -121,6 +124,90 @@ def select_evenly_spaced_points(x_values, y_values, point_count):
     indices = np.linspace(0, len(x_values) - 1, num=point_count, dtype=int)
     return np.asarray(x_values)[indices], np.asarray(y_values)[indices]
 
+def parse_csv_table(csv_bytes):
+    try:
+        csv_text = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        csv_text = csv_bytes.decode("cp932")
+
+    table = list(csv.reader(io.StringIO(csv_text)))
+    if not table:
+        raise ValueError("CSVにデータがありません。")
+
+    headers = [header.strip() for header in table[0]]
+    if len(headers) < 2 or any(not header for header in headers):
+        raise ValueError("CSVの1行目に空欄のない列名を2つ以上設定してください。")
+    if len(set(headers)) != len(headers):
+        raise ValueError("CSVの列名が重複しています。列名をそれぞれ異なるものにしてください。")
+
+    rows = []
+    for row_number, row in enumerate(table[1:], start=2):
+        if not any(value.strip() for value in row):
+            continue
+        if len(row) != len(headers):
+            raise ValueError(f"{row_number}行目の列数が見出しと一致しません。")
+        rows.append([value.strip() for value in row])
+
+    return headers, rows
+
+def parse_numeric_columns(headers, rows, input_columns, target_columns):
+    if not isinstance(input_columns, list) or not isinstance(target_columns, list):
+        raise ValueError("条件列と結果列を選択してください。")
+    if not input_columns or not target_columns:
+        raise ValueError("条件列と結果列をそれぞれ1列以上選択してください。")
+    if any(not isinstance(column, str) for column in input_columns + target_columns):
+        raise ValueError("列名の指定が正しくありません。")
+    if len(set(input_columns)) != len(input_columns) or len(set(target_columns)) != len(target_columns):
+        raise ValueError("同じ列を重複して選択できません。")
+    if set(input_columns) & set(target_columns):
+        raise ValueError("同じ列を条件列と結果列の両方には指定できません。")
+    if any(column not in headers for column in input_columns + target_columns):
+        raise ValueError("選択した列がCSVにありません。CSVを選び直してください。")
+
+    selected_columns = input_columns + target_columns
+    column_indices = [headers.index(column) for column in selected_columns]
+    numeric_rows = []
+    for row_number, row in enumerate(rows, start=2):
+        try:
+            values = [float(row[index]) for index in column_indices]
+        except ValueError as error:
+            raise ValueError(f"{row_number}行目に数値でない値があります。") from error
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{row_number}行目に無限大または無効な数値があります。")
+        numeric_rows.append(values)
+
+    if len(numeric_rows) < 5:
+        raise ValueError("機械学習には5行以上の測定データが必要です。")
+
+    values = np.asarray(numeric_rows, dtype=float)
+    return values[:, :len(input_columns)], values[:, len(input_columns):]
+
+def select_evenly_spaced_rows(input_values, target_values, row_count):
+    indices = np.linspace(0, len(input_values) - 1, num=row_count, dtype=int)
+    return np.asarray(input_values)[indices], np.asarray(target_values)[indices]
+
+def load_experiment_table(spec):
+    input_columns = spec.get("input_columns")
+    target_columns = spec.get("target_columns")
+
+    if input_columns and target_columns and spec.get("csv_file_id"):
+        csv_bytes = fs.get(spec["csv_file_id"]).read()
+        headers, rows = parse_csv_table(csv_bytes)
+        input_values, target_values = parse_numeric_columns(
+            headers, rows, input_columns, target_columns
+        )
+        return input_columns, target_columns, input_values, target_values
+
+    x_values, y_values = read_experiment_csv(ensure_experiment_csv(spec))
+    input_name = spec.get("x_label", "X")
+    target_name = spec.get("y_label", "Y")
+    return (
+        [input_name],
+        [target_name],
+        np.asarray(x_values, dtype=float).reshape(-1, 1),
+        np.asarray(y_values, dtype=float).reshape(-1, 1)
+    )
+
 def get_image_data(image_id):
     try:
         if not fs.exists(image_id):
@@ -159,21 +246,39 @@ def load_messages():
             })
             
         for spec in spectrums:
-            x_vals = spec.get('x_values', spec.get('wavelengths', []))
-            y_vals = spec.get('y_values', spec.get('intensities', []))
-            x_lbl = spec.get('x_label', 'Wavelength (nm)')
-            y_lbl = spec.get('y_label', 'Intensity')
-            
-            data_points = len(x_vals)
+            input_columns = spec.get("input_columns")
+            target_columns = spec.get("target_columns")
+            if input_columns and target_columns:
+                x_vals = []
+                y_vals = []
+                x_lbl = ", ".join(input_columns)
+                y_lbl = ", ".join(target_columns)
+                data_points = spec.get("row_count", 0)
+                message = (
+                    f"【{spec.get('domain', '実験データ')}】{data_points} 行"
+                    f" / 条件: {x_lbl} / 結果: {y_lbl}"
+                )
+            else:
+                x_vals = spec.get('x_values', spec.get('wavelengths', []))
+                y_vals = spec.get('y_values', spec.get('intensities', []))
+                x_lbl = spec.get('x_label', 'Wavelength (nm)')
+                y_lbl = spec.get('y_label', 'Intensity')
+                data_points = len(x_vals)
+                message = f"【実験データ】{data_points} 点の {x_lbl} / {y_lbl} データを保持"
+
             combined_timeline.append({
                 'id': str(spec['_id']),
                 'date': spec.get('date', datetime.now()),
                 'project_name': spec.get('project_name', '未分類'),
                 'material_name': spec.get('material_name', '名称不明'),
-                'message': f"【実験データ】{data_points} 点の {x_lbl} / {y_lbl} データを保持",
+                'domain': spec.get('domain', '未分類'),
+                'message': message,
                 'h_val': 'N/A', 's_val': 'N/A', 'v_val': 'N/A',
                 'image_data': "",
                 'type': 'csv',
+                'row_count': data_points,
+                'input_columns': input_columns or [x_lbl],
+                'target_columns': target_columns or [y_lbl],
                 'x_label': x_lbl,
                 'y_label': y_lbl,
                 'x_values': x_vals,
@@ -239,22 +344,91 @@ def list_experiments():
     try:
         experiments = []
         for spec in db.spectrums.find().sort("date", -1):
-            path = ensure_experiment_csv(spec)
-            x_values, y_values = read_experiment_csv(path)
+            input_columns = spec.get("input_columns")
+            target_columns = spec.get("target_columns")
+            if input_columns and target_columns and spec.get("csv_file_id"):
+                point_count = spec.get("row_count", 0)
+            else:
+                input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
+                point_count = min(len(input_values), len(target_values))
             date = spec.get("date")
             experiments.append({
                 "id": str(spec["_id"]),
                 "project_name": spec.get("project_name", "未分類"),
                 "material_name": spec.get("material_name", "名称不明"),
+                "domain": spec.get("domain", "未分類"),
                 "date": date.isoformat() if isinstance(date, datetime) else str(date or ""),
-                "x_label": spec.get("x_label", "Wavelength (nm)"),
-                "y_label": spec.get("y_label", "Intensity"),
-                "point_count": min(len(x_values), len(y_values))
+                "input_columns": input_columns,
+                "target_columns": target_columns,
+                "point_count": point_count
             })
         return {"experiments": experiments}
     except Exception:
         traceback.print_exc()
         return {"error": "実験データ一覧の読み込みに失敗しました。"}, 500
+
+@app.route("/api/csv/preview", methods=["POST"])
+def preview_csv():
+    uploaded_file = request.files.get("file")
+    if not uploaded_file or not uploaded_file.filename:
+        return {"error": "CSVファイルを選択してください。"}, 400
+
+    try:
+        headers, rows = parse_csv_table(uploaded_file.read())
+        return {"columns": headers, "preview": rows[:5], "row_count": len(rows)}
+    except (UnicodeDecodeError, csv.Error, ValueError) as error:
+        return {"error": str(error)}, 400
+
+@app.route("/api/experiments", methods=["POST"])
+def create_experiment():
+    uploaded_file = request.files.get("file")
+    if not uploaded_file or not uploaded_file.filename:
+        return {"error": "CSVファイルを選択してください。"}, 400
+
+    try:
+        csv_bytes = uploaded_file.read()
+        headers, rows = parse_csv_table(csv_bytes)
+        input_columns = json.loads(request.form.get("input_columns", "[]"))
+        target_columns = json.loads(request.form.get("target_columns", "[]"))
+        input_values, target_values = parse_numeric_columns(
+            headers, rows, input_columns, target_columns
+        )
+
+        experiment_id = ObjectId()
+        file_id = fs.put(
+            csv_bytes,
+            filename=uploaded_file.filename,
+            content_type="text/csv",
+            metadata={"experiment_id": str(experiment_id), "kind": "experiment_data"}
+        )
+        try:
+            db.spectrums.insert_one({
+                "_id": experiment_id,
+                "project_name": request.form.get("project_name", "未分類"),
+                "material_name": request.form.get("material_name", "名称不明"),
+                "domain": request.form.get("domain", "未分類"),
+                "csv_filename": uploaded_file.filename,
+                "csv_file_id": file_id,
+                "input_columns": input_columns,
+                "target_columns": target_columns,
+                "row_count": len(input_values),
+                "date": datetime.now()
+            })
+        except Exception:
+            fs.delete(file_id)
+            raise
+
+        return {
+            "id": str(experiment_id),
+            "input_columns": input_columns,
+            "target_columns": target_columns,
+            "row_count": len(input_values)
+        }, 201
+    except (UnicodeDecodeError, csv.Error, ValueError, json.JSONDecodeError) as error:
+        return {"error": str(error)}, 400
+    except Exception:
+        traceback.print_exc()
+        return {"error": "実験データの保存に失敗しました。"}, 500
 
 @socketio.on('send csv data')
 def handle_csv_data(data):
@@ -339,7 +513,10 @@ def delete_message(data):
         target_spec = db.spectrums.find_one({"_id": ObjectId(msg_id)})
         if target_spec:
             db.spectrums.delete_one({"_id": ObjectId(msg_id)})
-            experiment_csv_path(target_spec["_id"]).unlink(missing_ok=True)
+            if target_spec.get("csv_file_id"):
+                fs.delete(target_spec["csv_file_id"])
+            else:
+                experiment_csv_path(target_spec["_id"]).unlink(missing_ok=True)
             emit('message deleted', {'id': msg_id}, broadcast=True)
             return
 
@@ -505,6 +682,7 @@ def download_excel():
 #  サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
 model_cache = {
     "cache_key": None,
+    "scaler": None,
     "gp_model": None
 }
 
@@ -512,9 +690,6 @@ model_cache = {
 def predict_dynamic():
     try:
         req_data = request.get_json() or {}
-        target_temp = float(req_data.get("temperature", 25.0))
-        target_mat_a = float(req_data.get("material_a", 1.5))
-        target_mat_b = float(req_data.get("material_b", 0.5))
         experiment_id = req_data.get("experiment_id")
         if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
             return {"error": "学習対象の実験を選択してください。"}, 400
@@ -523,10 +698,10 @@ def predict_dynamic():
         if not spec:
             return {"error": "選択した実験データが見つかりません。"}, 404
 
-        x_vals, y_vals = read_experiment_csv(ensure_experiment_csv(spec))
-        point_total = min(len(x_vals), len(y_vals))
+        input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
+        point_total = len(input_values)
         if point_total < 5:
-            return {"error": "学習させるためのデータ点が足りません(最低5点以上必要です)。"}, 400
+            return {"error": "機械学習には5行以上の測定データが必要です。"}, 400
 
         requested_points = req_data.get("training_points", min(250, point_total))
         if isinstance(requested_points, bool) or not isinstance(requested_points, int):
@@ -534,62 +709,75 @@ def predict_dynamic():
         if requested_points < 5 or requested_points > point_total:
             return {"error": f"学習点数は5〜{point_total}の範囲で指定してください。"}, 400
 
-        spec_id = str(spec["_id"])
-        cache_key = (spec_id, requested_points)
+        conditions = req_data.get("conditions")
+        if not isinstance(conditions, dict) or set(conditions) != set(input_columns):
+            return {"error": "すべての実験条件を入力してください。"}, 400
+
+        try:
+            query_values = [float(conditions[column]) for column in input_columns]
+        except (TypeError, ValueError):
+            return {"error": "実験条件は数値で入力してください。"}, 400
+        if not np.all(np.isfinite(query_values)):
+            return {"error": "実験条件に無効な数値があります。"}, 400
+
+        cache_key = (
+            str(spec["_id"]),
+            tuple(input_columns),
+            tuple(target_columns),
+            requested_points
+        )
         if model_cache["cache_key"] != cache_key or model_cache["gp_model"] is None:
-            print("🔄 実験データまたは学習点数が変更されたため、GPRモデルを学習します...")
-            x_train, y_train_values = select_evenly_spaced_points(
-                x_vals, y_vals, requested_points
+            print("🔄 実験データから多次元・複数結果のGPRモデルを学習します...")
+            x_train, y_train = select_evenly_spaced_rows(
+                input_values, target_values, requested_points
             )
+            scaler = StandardScaler()
+            scaled_train = scaler.fit_transform(x_train)
+            kernel = (
+                C(1.0, (1e-3, 1e3))
+                * RBF(
+                    np.ones(len(input_columns)),
+                    (1e-2, 1e2)
+                )
+                + WhiteKernel(noise_level=0.1)
+            )
+            gp = GaussianProcessRegressor(
+                kernel=kernel,
+                n_restarts_optimizer=1,
+                alpha=1e-6,
+                normalize_y=True
+            )
+            gp.fit(scaled_train, y_train)
 
-            temp = float(spec.get('temperature', 25.0))
-            mat_a = float(spec.get('material_a', 1.5))
-            mat_b = float(spec.get('material_b', 1.5))
-
-            X_train = np.column_stack((
-                x_train,
-                np.full(requested_points, temp),
-                np.full(requested_points, mat_a),
-                np.full(requested_points, mat_b)
-            ))
-            y_train = np.asarray(y_train_values)
-
-            # ガウス過程回帰の構築と学習（n_restarts_optimizer=1で高速化）
-            kernel = C(1.0, (1e-3, 1e3)) * RBF([1.0, 10.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(noise_level=0.1)
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=1, alpha=1e-6)
-            
-            gp.fit(X_train, y_train)
-
-            # メモリ上に保存
             model_cache["cache_key"] = cache_key
+            model_cache["scaler"] = scaler
             model_cache["gp_model"] = gp
         else:
             print("⚡ キャッシュされたGPRモデルを使用します")
 
-        # 予測フェーズ（学習済みモデルを使って一瞬で計算）
-        gp = model_cache["gp_model"]
-        predict_times = np.linspace(min(x_vals), max(x_vals), 100)
-        
-        X_predict = np.array([[pt, target_temp, target_mat_a, target_mat_b] for pt in predict_times])
-        y_pred, y_std = gp.predict(X_predict, return_std=True)
+        query = np.asarray([query_values], dtype=float)
+        y_pred, y_std = model_cache["gp_model"].predict(
+            model_cache["scaler"].transform(query),
+            return_std=True
+        )
+        prediction_values = np.asarray(y_pred).reshape(-1)
+        std_values = np.asarray(y_std).reshape(-1)
 
-        response_data = {
-            "experiment_id": spec_id,
+        return {
+            "experiment_id": str(spec["_id"]),
             "training_points": requested_points,
             "total_points": point_total,
-            "x_label": spec.get("x_label", "X軸"),
-            "y_label": spec.get("y_label", "Y軸"),
-            "times": predict_times.tolist(),
-            "predictions": y_pred.tolist(),
-            "confidence_high": (y_pred + 1.96 * y_std).tolist(),
-            "confidence_low": (y_pred - 1.96 * y_std).tolist(),
-            "target_conditions": {
-                "temperature": target_temp,
-                "material_a": target_mat_a,
-                "material_b": target_mat_b
-            }
+            "input_conditions": dict(zip(input_columns, query_values)),
+            "predictions": dict(zip(target_columns, prediction_values.tolist())),
+            "confidence_high": dict(zip(
+                target_columns,
+                (prediction_values + 1.96 * std_values).tolist()
+            )),
+            "confidence_low": dict(zip(
+                target_columns,
+                (prediction_values - 1.96 * std_values).tolist()
+            ))
         }
-        return response_data
 
     except Exception as e:
         traceback.print_exc()

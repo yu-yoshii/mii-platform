@@ -306,40 +306,22 @@
             <label>試料名 (マテリアル)</label>
             <input type="text" id="csv_material_name" placeholder="例: サンプルA(物性)">
         </div>
-
         <div class="input-group">
-            <label>X軸のデータ種類 (1列目)</label>
-            <select id="x_preset" onchange="toggleCustomInput('x')">
-                <option value="Wavelength (nm)">波長 (nm)</option>
-                <option value="Voltage (V)">電流 (mA)</option>
-                <option value="Temperature (℃)">温度 (℃)</option>
-                <option value="Time (sec)">時間 (sec)</option>
-                <option value="custom">その他 (自分で入力)</option>
-            </select>
-            <div id="x_custom_div" class="custom-input-box">
-                <input type="text" id="x_custom_val" placeholder="例: 磁場 (T)">
-            </div>
+            <label>分野</label>
+            <input type="text" id="csv_domain" placeholder="例: MI、EMC、光学">
         </div>
-
         <div class="input-group">
-            <label>Y軸のデータ種類 (2列目)</label>
-            <select id="y_preset" onchange="toggleCustomInput('y')">
-                <option value="Intensity">光度 (Intensity)</option>
-                <option value="Current (mA)">電圧 (V)</option>
-                <option value="Absorbance">吸光度 (Absorbance)</option>
-                <option value="Weight (mg)">重量 (mg)</option>
-                <option value="custom">その他 (自分で入力)</option>
-            </select>
-            <div id="y_custom_div" class="custom-input-box">
-                <input type="text" id="y_custom_val" placeholder="例: 抵抗 (Ω)">
-            </div>
+            <label>CSVファイル（1行目は列名、以降は測定値）</label>
+            <input type="file" id="csv_file" accept=".csv,text/csv" onchange="previewCSV()">
         </div>
-
-        <div class="input-group">
-            <label>CSVファイル (.csv)</label>
-            <input type="file" id="csv_file" accept=".csv">
+        <div id="csv_role_editor" style="display:none; margin:15px 0;">
+            <p style="font-size:0.9em; color:#64748b;">
+                各列を「条件（入力）」または「結果（予測）」に分類してください。数値の列を選びます。
+            </p>
+            <div id="csv_column_roles"></div>
+            <div id="csv_preview" style="overflow-x:auto; margin-top:12px;"></div>
         </div>
-        <button class="btn-primary" onclick="sendCSV()">実験データを保存</button>
+        <button class="btn-primary" id="save_csv_button" onclick="sendCSV()" disabled>実験データを保存</button>
         
         <div class="download-zone">
             <label style="font-size: 0.85em; font-weight: 600; color: #64748b; display:block; margin-bottom:5px;">データエクスポート</label>
@@ -382,16 +364,6 @@
         let isNewest = false;
         let myChart = null; 
 
-        function toggleCustomInput(axis) {
-            const preset = document.getElementById(`${axis}_preset`).value;
-            const customDiv = document.getElementById(`${axis}_custom_div`);
-            if (preset === 'custom') {
-                customDiv.style.display = 'block';
-            } else {
-                customDiv.style.display = 'none';
-            }
-        }
-
         socket.on('connect', () => {
             document.getElementById('status').innerText = "● 接続完了";
             document.getElementById('status').style.color = "var(--success)";
@@ -428,50 +400,116 @@
             fileInput.value = '';
         }
 
-        function sendCSV() {
+        async function previewCSV() {
+            const fileInput = document.getElementById('csv_file');
+            const roleEditor = document.getElementById('csv_role_editor');
+            const roleContainer = document.getElementById('csv_column_roles');
+            const saveButton = document.getElementById('save_csv_button');
+            roleEditor.style.display = 'none';
+            roleContainer.replaceChildren();
+            saveButton.disabled = true;
+
+            if (fileInput.files.length === 0) return;
+
+            try {
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                const response = await fetch('/api/csv/preview', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'CSVを読み込めませんでした。');
+
+                result.columns.forEach(column => {
+                    const row = document.createElement('div');
+                    row.style.cssText = 'display:flex; align-items:center; gap:10px; margin:6px 0;';
+                    const label = document.createElement('label');
+                    label.textContent = column;
+                    label.style.cssText = 'flex:1; overflow-wrap:anywhere;';
+                    const select = document.createElement('select');
+                    select.dataset.column = column;
+                    select.style.flex = '1';
+                    [
+                        ['ignore', '使わない'],
+                        ['input', '条件（入力）'],
+                        ['target', '結果（予測）']
+                    ].forEach(([value, text]) => select.add(new Option(text, value)));
+                    select.addEventListener('change', updateCsvRoleValidity);
+                    row.append(label, select);
+                    roleContainer.append(row);
+                });
+
+                const preview = document.getElementById('csv_preview');
+                preview.replaceChildren();
+                const table = document.createElement('table');
+                table.style.cssText = 'border-collapse:collapse; font-size:0.8em; width:100%;';
+                [result.columns, ...result.preview].forEach((values, rowIndex) => {
+                    const row = document.createElement('tr');
+                    values.forEach(value => {
+                        const cell = document.createElement(rowIndex === 0 ? 'th' : 'td');
+                        cell.textContent = value;
+                        cell.style.cssText = 'border:1px solid #e2e8f0; padding:5px; text-align:left;';
+                        row.append(cell);
+                    });
+                    table.append(row);
+                });
+                preview.append(table);
+                roleEditor.style.display = 'block';
+                updateCsvRoleValidity();
+            } catch (error) {
+                alert(error.message);
+            }
+        }
+
+        function updateCsvRoleValidity() {
+            const roles = [...document.querySelectorAll('#csv_column_roles select')];
+            const inputCount = roles.filter(select => select.value === 'input').length;
+            const targetCount = roles.filter(select => select.value === 'target').length;
+            document.getElementById('save_csv_button').disabled =
+                document.getElementById('csv_file').files.length === 0 ||
+                inputCount === 0 ||
+                targetCount === 0;
+        }
+
+        async function sendCSV() {
             const projInput = document.getElementById('csv_project_name');
             const matInput = document.getElementById('csv_material_name');
             const fileInput = document.getElementById('csv_file');
-            
+
             if (fileInput.files.length === 0) return alert("CSVファイルを選択してください");
 
-            let xLabel = document.getElementById('x_preset').value;
-            if (xLabel === 'custom') {
-                xLabel = document.getElementById('x_custom_val').value || 'X軸データ';
+            const roles = [...document.querySelectorAll('#csv_column_roles select')];
+            const inputColumns = roles.filter(select => select.value === 'input').map(select => select.dataset.column);
+            const targetColumns = roles.filter(select => select.value === 'target').map(select => select.dataset.column);
+            if (inputColumns.length === 0 || targetColumns.length === 0) {
+                return alert('条件列と結果列をそれぞれ1列以上選んでください。');
             }
-            let yLabel = document.getElementById('y_preset').value;
-            if (yLabel === 'custom') {
-                yLabel = document.getElementById('y_custom_val').value || 'Y軸データ';
-            }
-            
-            const file = fileInput.files[0];
-            const reader = new FileReader();
-            
-            reader.onload = function(e) {
-                const text = e.target.result;
-                
 
-                socket.emit('send csv data', {
-                    project_name: projInput.value || '未分類',
-                    material_name: matInput.value || '名称不明',
-                    csv_text: text,
-                    x_label: xLabel,
-                    y_label: yLabel
-                });
-                
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            formData.append('project_name', projInput.value || '未分類');
+            formData.append('material_name', matInput.value || '名称不明');
+            formData.append('domain', document.getElementById('csv_domain').value || '未分類');
+            formData.append('input_columns', JSON.stringify(inputColumns));
+            formData.append('target_columns', JSON.stringify(targetColumns));
+
+            const saveButton = document.getElementById('save_csv_button');
+            saveButton.disabled = true;
+            try {
+                const response = await fetch('/api/experiments', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || '実験データを保存できませんでした。');
+
+                socket.emit('load messages');
                 fileInput.value = '';
-                // 入力欄もリセット
-                document.getElementById('x_custom_val').value = '';
-                document.getElementById('y_custom_val').value = '';
-                document.getElementById('x_preset').value = 'Wavelength (nm)';
-                document.getElementById('y_preset').value = 'Intensity';
-                toggleCustomInput('x');
-                toggleCustomInput('y');
-                
-                alert("実験CSVデータをサーバーに送信しました");
-            };
-            
-            reader.readAsText(file);
+                document.getElementById('csv_role_editor').style.display = 'none';
+                alert(`${result.row_count}行の実験データを保存しました。`);
+            } catch (error) {
+                alert(error.message);
+            } finally {
+                updateCsvRoleValidity();
+            }
         }
 
         socket.on('load all messages', function(messages) {
@@ -486,6 +524,10 @@
                     v_val: msg.v_val,
                     image_data: msg.image_data,
                     type: msg.type,
+                    domain: msg.domain || '未分類',
+                    row_count: msg.row_count,
+                    input_columns: msg.input_columns || [],
+                    target_columns: msg.target_columns || [],
                     x_label: msg.x_label || 'Wavelength (nm)',
                     y_label: msg.y_label || 'Intensity',
                     x_values: msg.x_values || msg.wavelengths || [],
@@ -506,6 +548,10 @@
                 v_val: msg.v_val,
                 image_data: msg.image_data,
                 type: msg.type,
+                domain: msg.domain || '未分類',
+                row_count: msg.row_count,
+                input_columns: msg.input_columns || [],
+                target_columns: msg.target_columns || [],
                 x_label: msg.x_label || 'Wavelength (nm)',
                 y_label: msg.y_label || 'Intensity',
                 x_values: msg.x_values || msg.wavelengths || [],
@@ -567,6 +613,16 @@
             document.getElementById('graphModal').classList.remove('active');
         }
 
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, character => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[character]);
+        }
+
         function updateUI() {
             const display = document.getElementById('display');
             if (!display) return;
@@ -582,40 +638,51 @@
             }
 
             display.innerHTML = filteredData.map(msg => {
+                const id = escapeHtml(msg._id);
+                const projectName = escapeHtml(msg.project_name || '未分類');
+                const materialName = escapeHtml(msg.material_name || '名称不明');
                 if (msg.image_data) {
                     return `
-                        <div class="card message-card" id="msg-${msg._id}">
-                            <button class="delete-btn" onclick="deleteMsg('${msg._id}', event)">×</button>
-                            <img src="${msg.image_data}" alt="Material Image">
+                        <div class="card message-card" id="msg-${id}">
+                            <button class="delete-btn" onclick="deleteMsg('${id}', event)">×</button>
+                            <img src="${escapeHtml(msg.image_data)}" alt="Material Image">
                             <div>
                                 <div class="badge-wrapper">
-                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${msg.project_name || '未分類'}</span>
-                                    <span class="badge" style="background:#dcfce7; color:#15803d;">${msg.material_name || '名称不明'}</span>
+                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${projectName}</span>
+                                    <span class="badge" style="background:#dcfce7; color:#15803d;">${materialName}</span>
                                 </div>
                                 <p style="margin:5px 0; font-weight:bold; color:var(--accent); font-size:0.95em;">
-                                     HSV解析結果: <span style="color:var(--text-main); font-weight:500;">H:${msg.h_val} / S:${msg.s_val} / V:${msg.v_val}</span>
+                                     HSV解析結果: <span style="color:var(--text-main); font-weight:500;">H:${escapeHtml(msg.h_val)} / S:${escapeHtml(msg.s_val)} / V:${escapeHtml(msg.v_val)}</span>
                                 </p>
-                                <p style="margin:5px 0; font-size:0.9em; color:#64748b;">${msg.message || '(条件メモなし)'}</p>
+                                <p style="margin:5px 0; font-size:0.9em; color:#64748b;">${escapeHtml(msg.message || '(条件メモなし)')}</p>
                             </div>
                         </div>
                     `;
                 } else {
-                    const dataCount = msg.x_values ? msg.x_values.length : 0;
+                    const dataCount = msg.row_count ?? (msg.x_values ? msg.x_values.length : 0);
+                    const inputColumns = (msg.input_columns || []).map(escapeHtml).join(', ');
+                    const targetColumns = (msg.target_columns || []).map(escapeHtml).join(', ');
+                    const description = msg.input_columns?.length
+                        ? `${inputColumns} → ${targetColumns} (${dataCount} 行)`
+                        : `${escapeHtml(msg.x_label)} - ${escapeHtml(msg.y_label)} (${dataCount} 点)`;
+                    const graphHandler = msg.x_values?.length
+                        ? `onclick="openGraph('${id}')"`
+                        : '';
                     return `
-                        <div class="card message-card csv-card" id="msg-${msg._id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" onclick="openGraph('${msg._id}')">
-                            <button class="delete-btn" onclick="deleteMsg('${msg._id}', event)">×</button>
+                        <div class="card message-card ${msg.x_values?.length ? 'csv-card' : ''}" id="msg-${id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" ${graphHandler}>
+                            <button class="delete-btn" onclick="deleteMsg('${id}', event)">×</button>
                             <div style="width: 100px; height: 75px; background: #8e44ad; color: white; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: bold; font-size: 0.75em; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); line-height: 1.3;">
                                 DATA<br>PLOTTER
                             </div>
                             <div>
                                 <div class="badge-wrapper">
-                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${msg.project_name || '未分類'}</span>
-                                    <span class="badge" style="background:#f3e8ff; color:#6b21a8;">${msg.material_name || '名称不明'}</span>
+                                    <span class="badge" style="background:#e0f2fe; color:#0369a1;">${projectName}</span>
+                                    <span class="badge" style="background:#f3e8ff; color:#6b21a8;">${materialName}</span>
                                 </div>
                                 <p style="margin:5px 0; font-weight:bold; color:#8e44ad; font-size:0.95em;">
-                                     解析データ: <span style="color:var(--text-main); font-weight:500;">${msg.x_label} - ${msg.y_label} (${dataCount} 点)</span>
+                                     ${escapeHtml(msg.domain || '実験')} データ: <span style="color:var(--text-main); font-weight:500;">${description}</span>
                                 </p>
-                                <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> クリックして相関データグラフを表示</p>
+                                <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> 条件と結果のデータを保存しました</p>
                             </div>
                         </div>
                     `;
@@ -626,12 +693,16 @@
         function updateProjectList() {
             const listDiv = document.getElementById('project_list');
             const projects = ['すべて', ...new Set(allData.map(d => d.project_name || '未分類'))];
-            
-            listDiv.innerHTML = projects.map(p => 
-                `<button class="project-btn ${currentProject === p ? 'active' : ''}" onclick="filterProject('${p}')">
-                    <span>📁 ${p}</span>
-                </button>`
-            ).join('');
+            listDiv.replaceChildren();
+            projects.forEach(project => {
+                const button = document.createElement('button');
+                button.className = `project-btn ${currentProject === project ? 'active' : ''}`;
+                const label = document.createElement('span');
+                label.textContent = `📁 ${project}`;
+                button.append(label);
+                button.addEventListener('click', () => filterProject(project));
+                listDiv.append(button);
+            });
         }
 
         function filterProject(name) {

@@ -2,8 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>MI AI Prediction Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <title>実験結果の予測</title>
     <style>
         :root {
             --bg-main: #f8fafc;
@@ -82,11 +81,27 @@
             font-size: 0.9em;
         }
         .nav-link:hover { text-decoration: underline; }
-        .chart-container {
-            position: relative;
-            height: 450px;
+        #conditionFields {
+            grid-column: 1 / -1;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+        }
+        #predictionResults {
+            margin-top: 24px;
+            overflow-x: auto;
+        }
+        #predictionResults table {
             width: 100%;
-            margin-top: 20px;
+            border-collapse: collapse;
+        }
+        #predictionResults th, #predictionResults td {
+            border: 1px solid var(--border);
+            padding: 10px;
+            text-align: left;
+        }
+        #predictionResults th {
+            background: #f1f5f9;
         }
     </style>
 </head>
@@ -95,9 +110,9 @@
     <div class="container">
         <a href="/" class="nav-link">← データ管理画面（データ収集・一覧）へ戻る</a>
         
-        <h2> ガウス過程回帰 予測シミュレーター</h2>
+        <h2> 実験データから結果を予測</h2>
         <p style="color: #64748b; font-size: 0.95em; margin-bottom: 25px;">
-            実験を選択し、データ全体から均等に抽出する学習点数を指定して予測します。
+            実験を選び、条件を入力すると、その条件でのすべての結果を予測します。
         </p>
 
         <div class="control-group">
@@ -112,31 +127,15 @@
                 <input type="number" id="trainingPoints" value="250" min="5" step="1">
                 <small class="input-help" id="trainingPointsHelp">全データから均等に抽出します。</small>
             </div>
-            <div class="input-box">
-                <label>温度 (℃)</label>
-                <input type="number" id="predTemp" value="25.0" step="0.1">
-            </div>
-            <div class="input-box">
-                <label>物質A量 (g)</label>
-                <input type="number" id="predMatA" value="1.5" step="0.1">
-            </div>
-            <div class="input-box">
-                <label>物質B量 (g)</label>
-                <input type="number" id="predMatB" value="0.5" step="0.1">
-            </div>
+            <div id="conditionFields"></div>
         </div>
 
         <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()" disabled> 予測シミュレーションを実行</button>
         <p id="experimentStatus" role="status" style="color:#64748b; font-size:0.9em;"></p>
-
-        <div class="chart-container">
-            <canvas id="predictionChart"></canvas>
-        </div>
+        <div id="predictionResults" aria-live="polite"></div>
     </div>
 
     <script>
-        let predictionChartInstance = null;
-
         async function loadExperiments() {
             const select = document.getElementById('experimentSelect');
             const status = document.getElementById('experimentStatus');
@@ -157,9 +156,11 @@
                 }
 
                 result.experiments.forEach(experiment => {
-                    const label = `${experiment.project_name} / ${experiment.material_name} — ${experiment.date} (${experiment.point_count}点)`;
+                    const label = `${experiment.project_name} / ${experiment.material_name} — ${experiment.domain} (${experiment.point_count}行)`;
                     const option = new Option(label, experiment.id);
                     option.dataset.pointCount = experiment.point_count;
+                    option.dataset.inputColumns = JSON.stringify(experiment.input_columns);
+                    option.dataset.targetColumns = JSON.stringify(experiment.target_columns);
                     select.add(option);
                 });
                 status.textContent = '';
@@ -173,10 +174,33 @@
 
         function updateTrainingPointLimit() {
             const select = document.getElementById('experimentSelect');
+            const selected = select.selectedOptions[0];
             const pointsInput = document.getElementById('trainingPoints');
             const help = document.getElementById('trainingPointsHelp');
             const button = document.getElementById('runPredictBtn');
-            const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
+            const totalPoints = Number(selected?.dataset.pointCount || 0);
+            const inputColumns = JSON.parse(selected?.dataset.inputColumns || '[]');
+            const conditionFields = document.getElementById('conditionFields');
+            conditionFields.replaceChildren();
+            document.getElementById('predictionResults').replaceChildren();
+
+            inputColumns.forEach(column => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'input-box';
+                const label = document.createElement('label');
+                label.textContent = column;
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.step = 'any';
+                input.required = true;
+                input.dataset.column = column;
+                input.addEventListener('input', () => {
+                    document.getElementById('predictionResults').replaceChildren();
+                    updatePredictButton();
+                });
+                wrapper.append(label, input);
+                conditionFields.append(wrapper);
+            });
 
             pointsInput.max = totalPoints || 5;
             pointsInput.value = totalPoints
@@ -193,24 +217,29 @@
             const pointsInput = document.getElementById('trainingPoints');
             const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
             const requestedPoints = Number(pointsInput.value);
+            const conditions = [...document.querySelectorAll('#conditionFields input')];
             document.getElementById('runPredictBtn').disabled =
                 !select.value ||
                 totalPoints < 5 ||
                 !Number.isInteger(requestedPoints) ||
                 requestedPoints < 5 ||
-                requestedPoints > totalPoints;
+                requestedPoints > totalPoints ||
+                conditions.length === 0 ||
+                conditions.some(input => !input.value || !Number.isFinite(Number(input.value)));
         }
 
         async function runPrediction() {
             const experiment_id = document.getElementById('experimentSelect').value;
             const training_points = Number(document.getElementById('trainingPoints').value);
-            const temperature = parseFloat(document.getElementById('predTemp').value);
-            const material_a = parseFloat(document.getElementById('predMatA').value);
-            const material_b = parseFloat(document.getElementById('predMatB').value);
+            const conditions = Object.fromEntries(
+                [...document.querySelectorAll('#conditionFields input')]
+                    .map(input => [input.dataset.column, Number(input.value)])
+            );
+            document.getElementById('predictionResults').replaceChildren();
 
             const btn = document.getElementById('runPredictBtn');
             btn.disabled = true;
-            btn.textContent = ' ガウス過程による回帰計算中...';
+            btn.textContent = '予測を計算しています...';
 
             try {
                 // 予測専用APIへPOSTリクエスト
@@ -220,97 +249,60 @@
                     body: JSON.stringify({
                         experiment_id,
                         training_points,
-                        temperature,
-                        material_a,
-                        material_b
+                        conditions
                     })
                 });
 
                 const result = await response.json();
 
                 if (response.ok) {
-                    renderPredictionChart(result);
+                    renderPredictionResults(result);
                 } else {
-                    alert('予測エラー: ' + (result.error || '不明なエラー'));
+                    throw new Error(result.error || '不明なエラー');
                 }
             } catch (err) {
-                console.error(err);
-                alert('サーバーとの通信に失敗しました。');
+                alert(`予測エラー: ${err.message}`);
             } finally {
                 btn.textContent = ' 予測シミュレーションを実行';
                 updatePredictButton();
             }
         }
 
-        function renderPredictionChart(data) {
-            const ctx = document.getElementById('predictionChart').getContext('2d');
-
-            if (predictionChartInstance) {
-                predictionChartInstance.destroy();
-            }
-
-            const times = data.times;
-            const predictions = data.predictions;
-            const high = data.confidence_high;
-            const low = data.confidence_low;
-            const cond = data.target_conditions;
-
-            predictionChartInstance = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: times.map(t => t.toFixed(1)),
-                    datasets: [
-                        {
-                            label: `予測平均 (Temp:${cond.temperature}℃, A:${cond.material_a}g, B:${cond.material_b}g)`,
-                            data: predictions,
-                            borderColor: '#3b82f6',
-                            backgroundColor: 'rgba(59, 130, 246, 0.05)',
-                            borderWidth: 2.5,
-                            pointRadius: 0,
-                            tension: 0.2
-                        },
-                        {
-                            label: '95% 信頼区間 上限',
-                            data: high,
-                            borderColor: 'rgba(59, 130, 246, 0.3)',
-                            borderWidth: 1,
-                            borderDash: [4, 4],
-                            pointRadius: 0,
-                            fill: false
-                        },
-                        {
-                            label: '95% 信頼区間 下限',
-                            data: low,
-                            borderColor: 'rgba(59, 130, 246, 0.3)',
-                            backgroundColor: 'rgba(59, 130, 246, 0.12)', // 信頼区間の帯を色塗り
-                            borderWidth: 1,
-                            borderDash: [4, 4],
-                            pointRadius: 0,
-                            fill: '-1' // 1つ前のデータセット（上限）と繋いで帯にする
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    interaction: { mode: 'index', intersect: false },
-                    plugins: {
-                        title: {
-                            display: true,
-                            text: 'Gaussian Process Regression (GPR) Prediction with Confidence Intervals',
-                            font: { size: 14 }
-                        }
-                    },
-                    scales: {
-                        x: { title: { display: true, text: data.x_label } },
-                        y: { title: { display: true, text: data.y_label } }
-                    }
-                }
+        function renderPredictionResults(data) {
+            const container = document.getElementById('predictionResults');
+            const summary = document.createElement('p');
+            summary.style.color = '#64748b';
+            summary.textContent =
+                `入力した条件: ${Object.entries(data.input_conditions).map(([name, value]) => `${name} = ${value}`).join('、')} / 学習に使用: ${data.training_points}行`;
+            const table = document.createElement('table');
+            const header = table.createTHead().insertRow();
+            ['結果', '予測値', '95%予測区間（下限）', '95%予測区間（上限）'].forEach(text => {
+                const cell = document.createElement('th');
+                cell.textContent = text;
+                header.append(cell);
             });
+
+            const body = table.createTBody();
+            Object.entries(data.predictions).forEach(([name, value]) => {
+                const row = body.insertRow();
+                [
+                    name,
+                    Number(value).toPrecision(6),
+                    Number(data.confidence_low[name]).toPrecision(6),
+                    Number(data.confidence_high[name]).toPrecision(6)
+                ].forEach(text => {
+                    const cell = row.insertCell();
+                    cell.textContent = text;
+                });
+            });
+            container.replaceChildren(summary, table);
         }
 
         document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
-        document.getElementById('trainingPoints').addEventListener('input', updatePredictButton);
+        document.getElementById('trainingPoints').addEventListener('input', () => {
+            document.getElementById('predictionResults').replaceChildren();
+            updatePredictButton();
+        });
         loadExperiments();
     </script>
 </body>
