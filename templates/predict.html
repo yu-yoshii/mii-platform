@@ -46,13 +46,19 @@
             color: #64748b;
             margin-bottom: 6px;
         }
-        .input-box input {
+        .input-box input, .input-box select {
             width: 100%;
             padding: 10px 14px;
             border-radius: var(--radius);
             border: 1px solid var(--border);
             box-sizing: border-box;
             font-size: 0.95em;
+        }
+        .input-help {
+            display: block;
+            margin-top: 6px;
+            color: #64748b;
+            font-size: 0.8em;
         }
         .btn-predict {
             background-color: var(--primary);
@@ -91,10 +97,21 @@
         
         <h2> ガウス過程回帰 予測シミュレーター</h2>
         <p style="color: #64748b; font-size: 0.95em; margin-bottom: 25px;">
-            蓄積された実験データからガウス過程モデルで学習し、任意の実験条件における未来の挙動と不確実性（95%信頼区間）をシミュレーションします。
+            実験を選択し、データ全体から均等に抽出する学習点数を指定して予測します。
         </p>
 
         <div class="control-group">
+            <div class="input-box">
+                <label for="experimentSelect">学習対象の実験</label>
+                <select id="experimentSelect">
+                    <option value="">実験データを読み込み中...</option>
+                </select>
+            </div>
+            <div class="input-box">
+                <label for="trainingPoints">学習に使う点数</label>
+                <input type="number" id="trainingPoints" value="250" min="5" step="1">
+                <small class="input-help" id="trainingPointsHelp">全データから均等に抽出します。</small>
+            </div>
             <div class="input-box">
                 <label>温度 (℃)</label>
                 <input type="number" id="predTemp" value="25.0" step="0.1">
@@ -109,7 +126,8 @@
             </div>
         </div>
 
-        <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()"> 予測シミュレーションを実行</button>
+        <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()" disabled> 予測シミュレーションを実行</button>
+        <p id="experimentStatus" role="status" style="color:#64748b; font-size:0.9em;"></p>
 
         <div class="chart-container">
             <canvas id="predictionChart"></canvas>
@@ -119,7 +137,73 @@
     <script>
         let predictionChartInstance = null;
 
+        async function loadExperiments() {
+            const select = document.getElementById('experimentSelect');
+            const status = document.getElementById('experimentStatus');
+
+            try {
+                const response = await fetch('/api/experiments');
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || '実験データを読み込めませんでした。');
+                }
+
+                select.replaceChildren();
+                if (result.experiments.length === 0) {
+                    select.add(new Option('実験データがありません', ''));
+                    status.textContent = '先にデータ管理画面からCSVを登録してください。';
+                    updateTrainingPointLimit();
+                    return;
+                }
+
+                result.experiments.forEach(experiment => {
+                    const label = `${experiment.project_name} / ${experiment.material_name} — ${experiment.date} (${experiment.point_count}点)`;
+                    const option = new Option(label, experiment.id);
+                    option.dataset.pointCount = experiment.point_count;
+                    select.add(option);
+                });
+                status.textContent = '';
+                updateTrainingPointLimit();
+            } catch (error) {
+                select.replaceChildren(new Option('実験データを読み込めません', ''));
+                status.textContent = error.message;
+                updateTrainingPointLimit();
+            }
+        }
+
+        function updateTrainingPointLimit() {
+            const select = document.getElementById('experimentSelect');
+            const pointsInput = document.getElementById('trainingPoints');
+            const help = document.getElementById('trainingPointsHelp');
+            const button = document.getElementById('runPredictBtn');
+            const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
+
+            pointsInput.max = totalPoints || 5;
+            pointsInput.value = totalPoints
+                ? Math.min(250, totalPoints)
+                : 5;
+            help.textContent = totalPoints < 5
+                ? `この実験は${totalPoints}点のため、予測には最低5点必要です。`
+                : `全${totalPoints}点から指定した点数を均等に抽出します。`;
+            updatePredictButton();
+        }
+
+        function updatePredictButton() {
+            const select = document.getElementById('experimentSelect');
+            const pointsInput = document.getElementById('trainingPoints');
+            const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
+            const requestedPoints = Number(pointsInput.value);
+            document.getElementById('runPredictBtn').disabled =
+                !select.value ||
+                totalPoints < 5 ||
+                !Number.isInteger(requestedPoints) ||
+                requestedPoints < 5 ||
+                requestedPoints > totalPoints;
+        }
+
         async function runPrediction() {
+            const experiment_id = document.getElementById('experimentSelect').value;
+            const training_points = Number(document.getElementById('trainingPoints').value);
             const temperature = parseFloat(document.getElementById('predTemp').value);
             const material_a = parseFloat(document.getElementById('predMatA').value);
             const material_b = parseFloat(document.getElementById('predMatB').value);
@@ -133,7 +217,13 @@
                 const response = await fetch('/api/predict_dynamic', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ temperature, material_a, material_b })
+                    body: JSON.stringify({
+                        experiment_id,
+                        training_points,
+                        temperature,
+                        material_a,
+                        material_b
+                    })
                 });
 
                 const result = await response.json();
@@ -147,8 +237,8 @@
                 console.error(err);
                 alert('サーバーとの通信に失敗しました。');
             } finally {
-                btn.disabled = false;
                 btn.textContent = ' 予測シミュレーションを実行';
+                updatePredictButton();
             }
         }
 
@@ -212,12 +302,16 @@
                         }
                     },
                     scales: {
-                        x: { title: { display: true, text: 'Time / X Axis' } },
-                        y: { title: { display: true, text: 'Predicted Response (y)' } }
+                        x: { title: { display: true, text: data.x_label } },
+                        y: { title: { display: true, text: data.y_label } }
                     }
                 }
             });
         }
+
+        document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
+        document.getElementById('trainingPoints').addEventListener('input', updatePredictButton);
+        loadExperiments();
     </script>
 </body>
 </html>
