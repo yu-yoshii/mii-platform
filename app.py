@@ -45,7 +45,7 @@ db = client["SNS"]
 fs = gridfs.GridFS(db)
 
 # =============================================================
-# 🌐 画面遷移ルーティング設定
+#  画面遷移ルーティング設定
 # =============================================================
 
 @app.route("/")
@@ -67,7 +67,7 @@ def get_image_data(image_id):
         return ""
 
 # =============================================================
-# 📥 Socket.IO 通信イベント群
+#  Socket.IO 通信イベント群
 # =============================================================
 
 @socketio.on('load messages')
@@ -251,7 +251,7 @@ def delete_message(data):
         traceback.print_exc()
 
 # =============================================================
-# 💾 HTTPルート群（項目別ダウンロード＆エクセル自動グラフ化）
+#  HTTPルート群（項目別ダウンロード＆エクセル自動グラフ化）
 # =============================================================
 
 @app.route("/download_csv")
@@ -406,7 +406,7 @@ def download_excel():
     except Exception as e:
         traceback.print_exc()
         return "Excel生成エラー", 500
-# 💡 サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
+#  サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
 model_cache = {
     "latest_id": None,
     "gp_model": None
@@ -420,7 +420,7 @@ def predict_dynamic():
         target_mat_a = float(req_data.get("material_a", 1.5))
         target_mat_b = float(req_data.get("material_b", 0.5))
 
-        # 1. データベースから最新の実験データを特定するためのIDを取得
+        # データベースから最新の実験データを特定するためのIDを取得
         latest_spec = db.spectrums.find_one(sort=[('_id', -1)])
         if not latest_spec:
             return {"error": "データベースに学習元のCSVデータがありません。"}, 400
@@ -432,11 +432,11 @@ def predict_dynamic():
         if len(x_vals) < 5:
             return {"error": "学習させるためのデータ点が足りません(最低5点以上必要です)。"}, 400
 
-        # 2. 【キャッシュ判定】データが新しくなった、またはまだ学習していない場合のみフィット（再学習）を行う
+        # 【キャッシュ判定】データが新しくなった、またはまだ学習していない場合のみフィット（再学習）を行う
         if model_cache["latest_id"] != spec_id or model_cache["gp_model"] is None:
             print("🔄 新しい実験データを検知しました。GPRモデルを学習・キャッシュします...")
             
-            # 💡 解像度を担保するため、最大点数を 250点 に設定
+            #  解像度を担保するため、最大点数を 250点 に設定
             max_points = 250
             if len(x_vals) > max_points:
                 step = len(x_vals) // max_points
@@ -468,7 +468,7 @@ def predict_dynamic():
         else:
             print("⚡ キャッシュされたGPRモデルを使用します（爆速）")
 
-        # 3. 予測フェーズ（学習済みモデルを使って一瞬で計算）
+        # 予測フェーズ（学習済みモデルを使って一瞬で計算）
         gp = model_cache["gp_model"]
         max_time = max(x_vals) if x_vals else 100
         predict_times = np.linspace(0, max_time, 100)
