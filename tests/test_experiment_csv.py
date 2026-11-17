@@ -63,15 +63,18 @@ class ExperimentCsvTests(unittest.TestCase):
         self.original_db = app_module.db
         self.original_fs = app_module.fs
         self.original_model_cache = app_module.model_cache.copy()
+        self.original_experiment_table_cache = app_module.experiment_table_cache.copy()
         self.temp_directory = tempfile.TemporaryDirectory()
         app_module.app.instance_path = self.temp_directory.name
         app_module.fs = FakeGridFS()
+        app_module.experiment_table_cache = {"cache_key": None, "table": None}
 
     def tearDown(self):
         app_module.app.instance_path = self.original_instance_path
         app_module.db = self.original_db
         app_module.fs = self.original_fs
         app_module.model_cache = self.original_model_cache
+        app_module.experiment_table_cache = self.original_experiment_table_cache
         self.temp_directory.cleanup()
 
     def test_saves_and_reads_experiment_csv(self):
@@ -163,6 +166,51 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(listed_experiment["input_columns"], ["temperature", "field"])
         self.assertEqual(listed_experiment["target_columns"], ["permeability", "loss"])
         self.assertEqual(listed_experiment["point_count"], 5)
+
+    def test_imports_more_than_800_rows_but_caps_gpr_training_sample(self):
+        csv_lines = ["x,y"]
+        csv_lines.extend(f"{value},{value * 2}" for value in range(1200))
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([])
+        )
+        response = app_module.app.test_client().post(
+            "/api/experiments",
+            data={
+                "file": (io.BytesIO("\n".join(csv_lines).encode()), "large.csv"),
+                "input_columns": '["x"]',
+                "target_columns": '["y"]'
+            },
+            content_type="multipart/form-data"
+        )
+
+        self.assertEqual(response.status_code, 201)
+        spec = app_module.db.spectrums.documents[0]
+        self.assertEqual(spec["row_count"], 1200)
+
+        invalid_training_request = app_module.app.test_client().post(
+            "/api/predict_dynamic",
+            json={
+                "experiment_id": str(spec["_id"]),
+                "training_points": 1200,
+                "conditions": {"x": 500}
+            }
+        )
+        self.assertEqual(invalid_training_request.status_code, 400)
+        self.assertIn("1000", invalid_training_request.json["error"])
+
+        invalid_grid_request = app_module.app.test_client().post(
+            "/api/predict_grid",
+            json={
+                "experiment_id": str(spec["_id"]),
+                "training_points": 1200,
+                "conditions": {"x": 500},
+                "x_column": "x",
+                "y_column": None,
+                "grid_size": 5
+            }
+        )
+        self.assertEqual(invalid_grid_request.status_code, 400)
+        self.assertIn("1000", invalid_grid_request.json["error"])
 
     def test_rejects_non_string_column_names(self):
         with self.assertRaisesRegex(ValueError, "列名の指定"):
@@ -305,6 +353,90 @@ class ExperimentCsvTests(unittest.TestCase):
             "permeability": 8.04,
             "loss": 16.08
         })
+
+    def test_prediction_grid_supports_surfaces_and_single_axis_bars(self):
+        csv_bytes = (
+            b"wavelength,time,intensity,absorbance\n"
+            b"400,0,1,0.1\n450,1,2,0.2\n500,2,3,0.3\n"
+            b"550,3,4,0.4\n600,4,5,0.5\n"
+        )
+        file_id = ObjectId()
+        app_module.fs.files[file_id] = csv_bytes
+        spec = {
+            "_id": ObjectId(),
+            "csv_file_id": file_id,
+            "input_columns": ["wavelength", "time"],
+            "target_columns": ["intensity", "absorbance"],
+            "row_count": 5
+        }
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([spec])
+        )
+        app_module.model_cache = {
+            "cache_key": None,
+            "gp_model": None,
+            "scaler": None
+        }
+
+        class FakeRegressor:
+            def __init__(self, **kwargs):
+                pass
+
+            def fit(self, x_values, y_values):
+                return self
+
+            def predict(self, x_values, return_std):
+                return (
+                    np.column_stack((
+                        x_values[:, 0] + x_values[:, 1],
+                        x_values[:, 0] - x_values[:, 1]
+                    )),
+                    np.ones((len(x_values), 2))
+                )
+
+        original_regressor = app_module.GaussianProcessRegressor
+        app_module.GaussianProcessRegressor = FakeRegressor
+        self.addCleanup(
+            setattr,
+            app_module,
+            "GaussianProcessRegressor",
+            original_regressor
+        )
+        client = app_module.app.test_client()
+        conditions = {"wavelength": 500, "time": 2}
+
+        surface = client.post(
+            "/api/predict_grid",
+            json={
+                "experiment_id": str(spec["_id"]),
+                "training_points": 5,
+                "conditions": conditions,
+                "x_column": "wavelength",
+                "y_column": "time",
+                "grid_size": 5
+            }
+        )
+        self.assertEqual(surface.status_code, 200)
+        self.assertEqual(len(surface.json["x_values"]), 5)
+        self.assertEqual(len(surface.json["y_values"]), 5)
+        self.assertEqual(len(surface.json["predictions"]["intensity"]), 5)
+        self.assertEqual(len(surface.json["predictions"]["intensity"][0]), 5)
+        self.assertEqual(len(surface.json["predictions"]["absorbance"][0]), 5)
+
+        line = client.post(
+            "/api/predict_grid",
+            json={
+                "experiment_id": str(spec["_id"]),
+                "training_points": 5,
+                "conditions": conditions,
+                "x_column": "wavelength",
+                "y_column": None,
+                "grid_size": 5
+            }
+        )
+        self.assertEqual(line.status_code, 200)
+        self.assertIsNone(line.json["y_values"])
+        self.assertEqual(len(line.json["predictions"]["intensity"]), 5)
 
 
 if __name__ == "__main__":
