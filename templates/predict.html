@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>実験結果の予測</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         :root {
             --bg-main: #f8fafc;
@@ -103,6 +104,25 @@
         #predictionResults th {
             background: #f1f5f9;
         }
+        .graph-panel {
+            margin-top: 30px;
+            border-top: 1px solid var(--border);
+            padding-top: 20px;
+        }
+        .graph-controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        #predictionGraph {
+            width: 100%;
+            min-height: 480px;
+        }
+        .graph-help {
+            color: #64748b;
+            font-size: 0.88em;
+        }
     </style>
 </head>
 <body>
@@ -133,9 +153,42 @@
         <button class="btn-predict" id="runPredictBtn" onclick="runPrediction()" disabled> 予測シミュレーションを実行</button>
         <p id="experimentStatus" role="status" style="color:#64748b; font-size:0.9em;"></p>
         <div id="predictionResults" aria-live="polite"></div>
+        <section class="graph-panel">
+            <h3>予測グラフ</h3>
+            <p class="graph-help" id="graphHelp">条件を入力して予測すると、グラフを表示できます。</p>
+            <div class="graph-controls">
+                <div class="input-box">
+                    <label for="graphDimension">グラフで見る条件の数</label>
+                    <select id="graphDimension">
+                        <option value="1">1つの条件を変える</option>
+                        <option value="2">2つの条件を変える</option>
+                    </select>
+                </div>
+                <div class="input-box">
+                    <label for="xAxisSelect">横軸</label>
+                    <select id="xAxisSelect"></select>
+                </div>
+                <div class="input-box" id="yAxisGroup">
+                    <label for="yAxisSelect">もう一つの条件（縦/奥行き）</label>
+                    <select id="yAxisSelect"></select>
+                </div>
+                <div class="input-box">
+                    <label for="targetSelect">表示する結果</label>
+                    <select id="targetSelect"></select>
+                </div>
+                <div class="input-box">
+                    <label for="graphStyle">グラフの形</label>
+                    <select id="graphStyle"></select>
+                </div>
+            </div>
+            <button type="button" class="btn-predict" id="drawGraphBtn" onclick="drawPredictionGraph()" disabled>グラフを更新</button>
+            <div id="predictionGraph" role="img" aria-label="実験結果の予測グラフ"></div>
+        </section>
     </div>
 
     <script>
+        let predictionAvailable = false;
+
         async function loadExperiments() {
             const select = document.getElementById('experimentSelect');
             const status = document.getElementById('experimentStatus');
@@ -180,9 +233,12 @@
             const button = document.getElementById('runPredictBtn');
             const totalPoints = Number(selected?.dataset.pointCount || 0);
             const inputColumns = JSON.parse(selected?.dataset.inputColumns || '[]');
+            const targetColumns = JSON.parse(selected?.dataset.targetColumns || '[]');
             const conditionFields = document.getElementById('conditionFields');
             conditionFields.replaceChildren();
             document.getElementById('predictionResults').replaceChildren();
+            predictionAvailable = false;
+            clearPredictionGraph();
 
             inputColumns.forEach(column => {
                 const wrapper = document.createElement('div');
@@ -196,19 +252,27 @@
                 input.dataset.column = column;
                 input.addEventListener('input', () => {
                     document.getElementById('predictionResults').replaceChildren();
+                    predictionAvailable = false;
+                    clearPredictionGraph();
+                    document.getElementById('graphHelp').textContent =
+                        '条件を変更しました。再度予測してください。';
                     updatePredictButton();
                 });
                 wrapper.append(label, input);
                 conditionFields.append(wrapper);
             });
 
-            pointsInput.max = totalPoints || 5;
+            const trainingLimit = Math.min(totalPoints, {{ max_training_points }});
+            pointsInput.max = trainingLimit || 5;
             pointsInput.value = totalPoints
-                ? Math.min(250, totalPoints)
+                ? Math.min({{ default_training_points }}, trainingLimit)
                 : 5;
             help.textContent = totalPoints < 5
                 ? `この実験は${totalPoints}点のため、予測には最低5点必要です。`
-                : `全${totalPoints}点から指定した点数を均等に抽出します。`;
+                : totalPoints > {{ max_training_points }}
+                    ? `全${totalPoints}行を登録済み。計算時は最大{{ max_training_points }}点を均等に抽出します。`
+                    : `全${totalPoints}行から指定した点数を均等に抽出します。`;
+            updateGraphControls(inputColumns, targetColumns, true);
             updatePredictButton();
         }
 
@@ -217,15 +281,64 @@
             const pointsInput = document.getElementById('trainingPoints');
             const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
             const requestedPoints = Number(pointsInput.value);
+            const trainingLimit = Math.min(totalPoints, {{ max_training_points }});
             const conditions = [...document.querySelectorAll('#conditionFields input')];
             document.getElementById('runPredictBtn').disabled =
                 !select.value ||
                 totalPoints < 5 ||
                 !Number.isInteger(requestedPoints) ||
                 requestedPoints < 5 ||
-                requestedPoints > totalPoints ||
+                requestedPoints > trainingLimit ||
                 conditions.length === 0 ||
                 conditions.some(input => !input.value || !Number.isFinite(Number(input.value)));
+        }
+
+        function updateGraphControls(inputColumns, targetColumns, resetDimension = false) {
+            const dimension = document.getElementById('graphDimension');
+            const xAxis = document.getElementById('xAxisSelect');
+            const yAxis = document.getElementById('yAxisSelect');
+            const target = document.getElementById('targetSelect');
+            const style = document.getElementById('graphStyle');
+            const previousX = xAxis.value;
+            const previousY = yAxis.value;
+            const previousTarget = target.value;
+            const previousStyle = style.value;
+
+            if (resetDimension) {
+                dimension.value = inputColumns.length > 1 ? '2' : '1';
+            } else if (inputColumns.length < 2) {
+                dimension.value = '1';
+            }
+            dimension.options[1].disabled = inputColumns.length < 2;
+            xAxis.replaceChildren(...inputColumns.map(column => new Option(column, column)));
+            xAxis.value = inputColumns.includes(previousX) ? previousX : inputColumns[0] || '';
+            const availableY = inputColumns.filter(column => column !== xAxis.value);
+            yAxis.replaceChildren(...availableY.map(column => new Option(column, column)));
+            yAxis.value = availableY.includes(previousY) ? previousY : availableY[0] || '';
+            target.replaceChildren(...targetColumns.map(column => new Option(column, column)));
+            target.value = targetColumns.includes(previousTarget) ? previousTarget : targetColumns[0] || '';
+
+            const isSurface = dimension.value === '2' && inputColumns.length > 1;
+            document.getElementById('yAxisGroup').style.display = isSurface ? '' : 'none';
+            const graphStyles = isSurface
+                ? [['立体曲面', 'surface'], ['色分け図', 'heatmap']]
+                : [['折れ線', 'line'], ['棒グラフ', 'bar']];
+            style.replaceChildren(...graphStyles.map(([label, value]) => new Option(label, value)));
+            style.value = graphStyles.some(([, value]) => value === previousStyle)
+                ? previousStyle
+                : graphStyles[0][1];
+            document.getElementById('graphHelp').textContent = isSurface
+                ? '選んだ2条件を全データ範囲で変化させ、その他の条件は入力値に固定して表示します。'
+                : '選んだ1条件を全データ範囲で変化させ、その他の条件は入力値に固定して表示します。';
+            if (predictionAvailable) clearPredictionGraph();
+            document.getElementById('drawGraphBtn').disabled = !predictionAvailable;
+        }
+
+        function clearPredictionGraph() {
+            const graph = document.getElementById('predictionGraph');
+            if (window.Plotly) Plotly.purge(graph);
+            graph.replaceChildren();
+            document.getElementById('drawGraphBtn').disabled = !predictionAvailable;
         }
 
         async function runPrediction() {
@@ -236,6 +349,8 @@
                     .map(input => [input.dataset.column, Number(input.value)])
             );
             document.getElementById('predictionResults').replaceChildren();
+            predictionAvailable = false;
+            clearPredictionGraph();
 
             const btn = document.getElementById('runPredictBtn');
             btn.disabled = true;
@@ -257,6 +372,9 @@
 
                 if (response.ok) {
                     renderPredictionResults(result);
+                    predictionAvailable = true;
+                    document.getElementById('drawGraphBtn').disabled = false;
+                    await drawPredictionGraph();
                 } else {
                     throw new Error(result.error || '不明なエラー');
                 }
@@ -298,10 +416,139 @@
             container.replaceChildren(summary, table);
         }
 
+        async function drawPredictionGraph() {
+            const select = document.getElementById('experimentSelect');
+            const conditions = Object.fromEntries(
+                [...document.querySelectorAll('#conditionFields input')]
+                    .map(input => [input.dataset.column, Number(input.value)])
+            );
+            const dimension = document.getElementById('graphDimension').value;
+            const drawButton = document.getElementById('drawGraphBtn');
+            drawButton.disabled = true;
+            drawButton.textContent = 'グラフを作成しています...';
+            try {
+                const response = await fetch('/api/predict_grid', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        experiment_id: select.value,
+                        training_points: Number(document.getElementById('trainingPoints').value),
+                        conditions,
+                        x_column: document.getElementById('xAxisSelect').value,
+                        y_column: dimension === '2'
+                            ? document.getElementById('yAxisSelect').value
+                            : null,
+                        grid_size: 40
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'グラフを作成できませんでした。');
+
+                const target = document.getElementById('targetSelect').value;
+                const style = document.getElementById('graphStyle').value;
+                const isSurface = data.y_values !== null;
+                const trace = isSurface
+                    ? style === 'surface'
+                        ? {
+                            type: 'surface',
+                            x: data.x_values,
+                            y: data.y_values,
+                            z: data.predictions[target],
+                            colorscale: 'Viridis',
+                            colorbar: { title: target }
+                        }
+                        : {
+                            type: 'heatmap',
+                            x: data.x_values,
+                            y: data.y_values,
+                            z: data.predictions[target],
+                            colorscale: 'Viridis',
+                            colorbar: { title: target }
+                        }
+                    : {
+                        type: style === 'bar' ? 'bar' : 'scatter',
+                        mode: style === 'bar' ? undefined : 'lines',
+                        x: data.x_values,
+                        y: data.predictions[target],
+                        name: target,
+                        error_y: {
+                            type: 'data',
+                            array: data.confidence_high[target].map(
+                                (value, index) => value - data.predictions[target][index]
+                            ),
+                            arrayminus: data.confidence_low[target].map(
+                                (value, index) => data.predictions[target][index] - value
+                            ),
+                            visible: true
+                        }
+                    };
+                const axisDescription = isSurface
+                    ? `${data.x_column} × ${data.y_column}`
+                    : data.x_column;
+                const fixedDescription = Object.entries(data.fixed_conditions)
+                    .map(([name, value]) => `${name}=${value}`)
+                    .join('、');
+                const layout = {
+                    title: `${target} の予測（${axisDescription}）`,
+                    autosize: true,
+                    margin: { l: 60, r: 30, t: 60, b: 60 },
+                    xaxis: { title: data.x_column },
+                    yaxis: { title: isSurface ? data.y_column : target }
+                };
+                if (style === 'surface') {
+                    layout.scene = {
+                        xaxis: { title: data.x_column },
+                        yaxis: { title: data.y_column },
+                        zaxis: { title: target }
+                    };
+                }
+                await Plotly.newPlot(
+                    document.getElementById('predictionGraph'),
+                    [trace],
+                    layout,
+                    { responsive: true, displaylogo: false }
+                );
+                document.getElementById('graphHelp').textContent =
+                    `全${data.total_points}行から${data.training_points}点で予測` +
+                    (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '');
+            } catch (error) {
+                document.getElementById('graphHelp').textContent = error.message;
+            } finally {
+                drawButton.disabled = !predictionAvailable;
+                drawButton.textContent = 'グラフを更新';
+            }
+        }
+
         document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
         document.getElementById('trainingPoints').addEventListener('input', () => {
             document.getElementById('predictionResults').replaceChildren();
+            predictionAvailable = false;
+            clearPredictionGraph();
+            document.getElementById('graphHelp').textContent =
+                '学習点数を変更しました。再度予測してください。';
             updatePredictButton();
+        });
+        document.getElementById('graphDimension').addEventListener('change', () => {
+            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            updateGraphControls(
+                JSON.parse(selected?.dataset.inputColumns || '[]'),
+                JSON.parse(selected?.dataset.targetColumns || '[]')
+            );
+        });
+        document.getElementById('xAxisSelect').addEventListener('change', () => {
+            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            updateGraphControls(
+                JSON.parse(selected?.dataset.inputColumns || '[]'),
+                JSON.parse(selected?.dataset.targetColumns || '[]')
+            );
+        });
+        ['yAxisSelect', 'targetSelect', 'graphStyle'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => {
+                if (!predictionAvailable) return;
+                clearPredictionGraph();
+                document.getElementById('graphHelp').textContent =
+                    '表示設定を変更しました。「グラフを更新」を押してください。';
+            });
         });
         loadExperiments();
     </script>

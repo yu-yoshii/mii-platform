@@ -41,6 +41,8 @@ from sklearn.preprocessing import StandardScaler
 app = Flask(__name__)
 # Flask（）でウェブアプリの仕組みを実体化している
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+MAX_GPR_TRAINING_POINTS = 1000
+DEFAULT_GPR_TRAINING_POINTS = 250
 
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20000000)
 
@@ -60,7 +62,11 @@ def index():
 
 @app.route("/predict")
 def predict_page():
-    return render_template("predict.html")
+    return render_template(
+        "predict.html",
+        max_training_points=MAX_GPR_TRAINING_POINTS,
+        default_training_points=DEFAULT_GPR_TRAINING_POINTS
+    )
 
 def experiment_csv_path(experiment_id):
     return Path(app.instance_path) / "experiments" / f"{experiment_id}.csv"
@@ -186,9 +192,53 @@ def select_evenly_spaced_rows(input_values, target_values, row_count):
     indices = np.linspace(0, len(input_values) - 1, num=row_count, dtype=int)
     return np.asarray(input_values)[indices], np.asarray(target_values)[indices]
 
+def get_experiment_model(spec, input_columns, target_columns, input_values, target_values, requested_points):
+    cache_key = (
+        str(spec["_id"]),
+        tuple(input_columns),
+        tuple(target_columns),
+        requested_points
+    )
+    if model_cache["cache_key"] != cache_key or model_cache.get("gp_model") is None:
+        print("🔄 実験データから多次元・複数結果のGPRモデルを学習します...")
+        x_train, y_train = select_evenly_spaced_rows(
+            input_values, target_values, requested_points
+        )
+        scaler = StandardScaler()
+        scaled_train = scaler.fit_transform(x_train)
+        kernel = (
+            C(1.0, (1e-3, 1e3))
+            * RBF(np.ones(len(input_columns)), (1e-2, 1e2))
+            + WhiteKernel(noise_level=0.1)
+        )
+        gp = GaussianProcessRegressor(
+            kernel=kernel,
+            n_restarts_optimizer=1,
+            alpha=1e-6,
+            normalize_y=True
+        )
+        gp.fit(scaled_train, y_train)
+        model_cache["cache_key"] = cache_key
+        model_cache["scaler"] = scaler
+        model_cache["gp_model"] = gp
+    else:
+        print("⚡ キャッシュされたGPRモデルを使用します")
+
+    return model_cache["scaler"], model_cache["gp_model"]
+
 def load_experiment_table(spec):
     input_columns = spec.get("input_columns")
     target_columns = spec.get("target_columns")
+    cache_key = (
+        str(spec["_id"]),
+        str(spec.get("csv_file_id", "legacy")),
+        tuple(input_columns or []),
+        tuple(target_columns or []),
+        spec.get("x_label"),
+        spec.get("y_label")
+    )
+    if experiment_table_cache["cache_key"] == cache_key:
+        return experiment_table_cache["table"]
 
     if input_columns and target_columns and spec.get("csv_file_id"):
         csv_bytes = fs.get(spec["csv_file_id"]).read()
@@ -196,17 +246,21 @@ def load_experiment_table(spec):
         input_values, target_values = parse_numeric_columns(
             headers, rows, input_columns, target_columns
         )
-        return input_columns, target_columns, input_values, target_values
+        table = (input_columns, target_columns, input_values, target_values)
+    else:
+        x_values, y_values = read_experiment_csv(ensure_experiment_csv(spec))
+        input_name = spec.get("x_label", "X")
+        target_name = spec.get("y_label", "Y")
+        table = (
+            [input_name],
+            [target_name],
+            np.asarray(x_values, dtype=float).reshape(-1, 1),
+            np.asarray(y_values, dtype=float).reshape(-1, 1)
+        )
 
-    x_values, y_values = read_experiment_csv(ensure_experiment_csv(spec))
-    input_name = spec.get("x_label", "X")
-    target_name = spec.get("y_label", "Y")
-    return (
-        [input_name],
-        [target_name],
-        np.asarray(x_values, dtype=float).reshape(-1, 1),
-        np.asarray(y_values, dtype=float).reshape(-1, 1)
-    )
+    experiment_table_cache["cache_key"] = cache_key
+    experiment_table_cache["table"] = table
+    return table
 
 def get_image_data(image_id):
     try:
@@ -680,6 +734,10 @@ def download_excel():
         traceback.print_exc()
         return "Excel生成エラー", 500
 #  サーバーのメモリ上に学習済みAIモデルを保持するためのキャッシュ箱
+experiment_table_cache = {
+    "cache_key": None,
+    "table": None
+}
 model_cache = {
     "cache_key": None,
     "scaler": None,
@@ -703,11 +761,20 @@ def predict_dynamic():
         if point_total < 5:
             return {"error": "機械学習には5行以上の測定データが必要です。"}, 400
 
-        requested_points = req_data.get("training_points", min(250, point_total))
+        requested_points = req_data.get(
+            "training_points",
+            min(DEFAULT_GPR_TRAINING_POINTS, point_total)
+        )
         if isinstance(requested_points, bool) or not isinstance(requested_points, int):
             return {"error": "学習点数は整数で指定してください。"}, 400
-        if requested_points < 5 or requested_points > point_total:
-            return {"error": f"学習点数は5〜{point_total}の範囲で指定してください。"}, 400
+        max_training_points = min(point_total, MAX_GPR_TRAINING_POINTS)
+        if requested_points < 5 or requested_points > max_training_points:
+            return {
+                "error": (
+                    f"学習点数は5〜{max_training_points}の範囲で指定してください。"
+                    f"登録データ全{point_total}行から均等に抽出します。"
+                )
+            }, 400
 
         conditions = req_data.get("conditions")
         if not isinstance(conditions, dict) or set(conditions) != set(input_columns):
@@ -720,46 +787,12 @@ def predict_dynamic():
         if not np.all(np.isfinite(query_values)):
             return {"error": "実験条件に無効な数値があります。"}, 400
 
-        cache_key = (
-            str(spec["_id"]),
-            tuple(input_columns),
-            tuple(target_columns),
-            requested_points
+        scaler, gp_model = get_experiment_model(
+            spec, input_columns, target_columns,
+            input_values, target_values, requested_points
         )
-        if model_cache["cache_key"] != cache_key or model_cache["gp_model"] is None:
-            print("🔄 実験データから多次元・複数結果のGPRモデルを学習します...")
-            x_train, y_train = select_evenly_spaced_rows(
-                input_values, target_values, requested_points
-            )
-            scaler = StandardScaler()
-            scaled_train = scaler.fit_transform(x_train)
-            kernel = (
-                C(1.0, (1e-3, 1e3))
-                * RBF(
-                    np.ones(len(input_columns)),
-                    (1e-2, 1e2)
-                )
-                + WhiteKernel(noise_level=0.1)
-            )
-            gp = GaussianProcessRegressor(
-                kernel=kernel,
-                n_restarts_optimizer=1,
-                alpha=1e-6,
-                normalize_y=True
-            )
-            gp.fit(scaled_train, y_train)
-
-            model_cache["cache_key"] = cache_key
-            model_cache["scaler"] = scaler
-            model_cache["gp_model"] = gp
-        else:
-            print("⚡ キャッシュされたGPRモデルを使用します")
-
         query = np.asarray([query_values], dtype=float)
-        y_pred, y_std = model_cache["gp_model"].predict(
-            model_cache["scaler"].transform(query),
-            return_std=True
-        )
+        y_pred, y_std = gp_model.predict(scaler.transform(query), return_std=True)
         prediction_values = np.asarray(y_pred).reshape(-1)
         std_values = np.asarray(y_std).reshape(-1)
 
@@ -782,5 +815,141 @@ def predict_dynamic():
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}, 500
+
+@app.route("/api/predict_grid", methods=["POST"])
+def predict_grid():
+    try:
+        req_data = request.get_json() or {}
+        experiment_id = req_data.get("experiment_id")
+        if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
+            return {"error": "学習対象の実験を選択してください。"}, 400
+
+        spec = db.spectrums.find_one({"_id": ObjectId(experiment_id)})
+        if not spec:
+            return {"error": "選択した実験データが見つかりません。"}, 404
+
+        input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
+        point_total = len(input_values)
+        max_training_points = min(point_total, MAX_GPR_TRAINING_POINTS)
+        requested_points = req_data.get(
+            "training_points",
+            min(DEFAULT_GPR_TRAINING_POINTS, point_total)
+        )
+        if (
+            isinstance(requested_points, bool)
+            or not isinstance(requested_points, int)
+            or requested_points < 5
+            or requested_points > max_training_points
+        ):
+            return {
+                "error": f"学習点数は5〜{max_training_points}の範囲で指定してください。"
+            }, 400
+
+        conditions = req_data.get("conditions")
+        if not isinstance(conditions, dict) or set(conditions) != set(input_columns):
+            return {"error": "すべての実験条件を入力してください。"}, 400
+        try:
+            fixed_values = np.asarray(
+                [float(conditions[column]) for column in input_columns],
+                dtype=float
+            )
+        except (TypeError, ValueError):
+            return {"error": "実験条件は数値で入力してください。"}, 400
+        if not np.all(np.isfinite(fixed_values)):
+            return {"error": "実験条件に無効な数値があります。"}, 400
+
+        x_column = req_data.get("x_column")
+        y_column = req_data.get("y_column")
+        if x_column not in input_columns:
+            return {"error": "グラフの横軸を選び直してください。"}, 400
+        if y_column is not None and (
+            y_column not in input_columns or y_column == x_column
+        ):
+            return {"error": "グラフの縦軸を選び直してください。"}, 400
+
+        grid_size = req_data.get("grid_size", 40)
+        max_grid_size = 100 if y_column is None else 60
+        if (
+            isinstance(grid_size, bool)
+            or not isinstance(grid_size, int)
+            or grid_size < 5
+            or grid_size > max_grid_size
+        ):
+            return {
+                "error": f"グラフの細かさは5〜{max_grid_size}の範囲で指定してください。"
+            }, 400
+
+        x_index = input_columns.index(x_column)
+        x_values = np.linspace(
+            float(np.min(input_values[:, x_index])),
+            float(np.max(input_values[:, x_index])),
+            grid_size
+        )
+        if y_column is None:
+            queries = np.tile(fixed_values, (grid_size, 1))
+            queries[:, x_index] = x_values
+            y_values = None
+        else:
+            y_index = input_columns.index(y_column)
+            y_values = np.linspace(
+                float(np.min(input_values[:, y_index])),
+                float(np.max(input_values[:, y_index])),
+                grid_size
+            )
+            x_mesh, y_mesh = np.meshgrid(x_values, y_values)
+            queries = np.tile(fixed_values, (grid_size * grid_size, 1))
+            queries[:, x_index] = x_mesh.ravel()
+            queries[:, y_index] = y_mesh.ravel()
+
+        scaler, gp_model = get_experiment_model(
+            spec, input_columns, target_columns,
+            input_values, target_values, requested_points
+        )
+        predicted, predicted_std = gp_model.predict(
+            scaler.transform(queries),
+            return_std=True
+        )
+        prediction_values = np.asarray(predicted)
+        std_values = np.asarray(predicted_std)
+
+        if prediction_values.ndim == 1:
+            prediction_values = prediction_values.reshape(-1, 1)
+            std_values = std_values.reshape(-1, 1)
+        if y_values is not None:
+            prediction_values = prediction_values.reshape(
+                grid_size, grid_size, len(target_columns)
+            )
+            std_values = std_values.reshape(
+                grid_size, grid_size, len(target_columns)
+            )
+
+        response = {
+            "x_column": x_column,
+            "y_column": y_column,
+            "x_values": x_values.tolist(),
+            "y_values": y_values.tolist() if y_values is not None else None,
+            "training_points": requested_points,
+            "total_points": point_total,
+            "fixed_conditions": {
+                column: float(fixed_values[index])
+                for index, column in enumerate(input_columns)
+                if column not in (x_column, y_column)
+            }
+        }
+        for target_index, target_column in enumerate(target_columns):
+            mean_values = prediction_values[..., target_index]
+            confidence_values = std_values[..., target_index]
+            response.setdefault("predictions", {})[target_column] = mean_values.tolist()
+            response.setdefault("confidence_low", {})[target_column] = (
+                mean_values - 1.96 * confidence_values
+            ).tolist()
+            response.setdefault("confidence_high", {})[target_column] = (
+                mean_values + 1.96 * confidence_values
+            ).tolist()
+        return response
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}, 500
+
 if __name__ == "__main__":
     socketio.run(app, debug=True, host="0.0.0.0", port=5000)
