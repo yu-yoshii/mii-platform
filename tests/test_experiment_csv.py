@@ -840,6 +840,14 @@ class ExperimentCsvTests(unittest.TestCase):
             "permeability": 8.04,
             "loss": 16.08
         })
+        self.assertEqual(
+            response.json["input_columns"],
+            ["temperature", "field"]
+        )
+        self.assertEqual(
+            response.json["target_columns"],
+            ["permeability", "loss"]
+        )
 
     def test_prediction_grid_supports_surfaces_and_single_axis_bars(self):
         csv_bytes = (

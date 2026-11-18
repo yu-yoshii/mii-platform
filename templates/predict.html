@@ -609,8 +609,8 @@
                 updateConditionRangeHint
             );
             updateGraphControls(
-                JSON.parse(selected?.dataset.inputColumns || '[]'),
-                JSON.parse(selected?.dataset.targetColumns || '[]')
+                data.input_columns || selected?.input_columns || [],
+                data.target_columns || selected?.target_columns || []
             );
             const summary = document.createElement('p');
             summary.style.color = '#64748b';
