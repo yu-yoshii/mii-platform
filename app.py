@@ -246,10 +246,13 @@ def fit_experiment_candidate(
             normalize_y=True
         )
         model.fit(scaled_values, target_values)
+        target_scale = np.std(target_values, axis=0)
+        target_scale[target_scale < 10 * np.finfo(float).eps] = 1.0
         return {
             "type": model_type,
             "scaler": scaler,
-            "estimator": model
+            "estimator": model,
+            "target_scale": target_scale
         }
     if model_type == "polynomial":
         polynomial = PolynomialFeatures(degree=2, include_bias=False)
@@ -305,6 +308,15 @@ def predict_experiment_candidate(model, input_values):
         np.asarray(scaled_mean).reshape(len(input_values), -1)
     )
     return mean, None
+
+
+def latent_function_standard_deviation(model, predictive_std):
+    estimator = model["estimator"]
+    noise_variance = (
+        estimator.kernel_.k2.noise_level * np.square(model["target_scale"])
+    )
+    predictive_variance = np.square(np.asarray(predictive_std))
+    return np.sqrt(np.maximum(predictive_variance - noise_variance, 0.0))
 
 
 def experiment_run_key(run, index):
@@ -1535,6 +1547,14 @@ def predict_dynamic():
             prediction_values.reshape(1, -1),
             None if y_std is None else np.asarray(y_std).reshape(1, -1)
         )
+        latent_std = (
+            None if y_std is None
+            else latent_function_standard_deviation(model, y_std)
+        )
+        latent_interval = gaussian_prediction_interval(
+            prediction_values.reshape(1, -1),
+            None if latent_std is None else np.asarray(latent_std).reshape(1, -1)
+        )
 
         training_ranges = {
             column: [
@@ -1567,6 +1587,10 @@ def predict_dynamic():
                 "level": interval["level"],
                 "method": interval["method"]
             },
+            "confidence_interval": None if latent_interval is None else {
+                "level": latent_interval["level"],
+                "method": "latent_function_posterior"
+            },
             "confidence_high": None if interval is None else dict(zip(
                 target_columns,
                 np.asarray(interval["upper"]).reshape(-1).tolist()
@@ -1574,6 +1598,14 @@ def predict_dynamic():
             "confidence_low": None if interval is None else dict(zip(
                 target_columns,
                 np.asarray(interval["lower"]).reshape(-1).tolist()
+            )),
+            "latent_confidence_high": None if latent_interval is None else dict(zip(
+                target_columns,
+                np.asarray(latent_interval["upper"]).reshape(-1).tolist()
+            )),
+            "latent_confidence_low": None if latent_interval is None else dict(zip(
+                target_columns,
+                np.asarray(latent_interval["lower"]).reshape(-1).tolist()
             ))
         }
 
@@ -1703,6 +1735,10 @@ def predict_grid():
                 std_values = std_values.reshape(
                     grid_size, grid_size, len(target_columns)
                 )
+        latent_std_values = (
+            None if std_values is None
+            else latent_function_standard_deviation(model, std_values)
+        )
 
         training_ranges = {
             column: [
@@ -1731,6 +1767,8 @@ def predict_grid():
         response = {
             "x_column": x_column,
             "y_column": y_column,
+            "input_columns": input_columns,
+            "target_columns": target_columns,
             "x_range": list(x_range),
             "y_range": list(y_range) if y_range is not None else None,
             "x_values": x_values.tolist(),
@@ -1753,6 +1791,10 @@ def predict_grid():
             "prediction_interval": None if std_values is None else {
                 "level": 0.95,
                 "method": "gaussian_process_posterior_predictive"
+            },
+            "confidence_interval": None if latent_std_values is None else {
+                "level": 0.95,
+                "method": "latent_function_posterior"
             }
         }
         for target_index, target_column in enumerate(target_columns):
@@ -1768,6 +1810,15 @@ def predict_grid():
                 response.setdefault("confidence_high", {})[target_column] = (
                     interval["upper"].tolist()
                 )
+                latent_interval = gaussian_prediction_interval(
+                    mean_values, latent_std_values[..., target_index]
+                )
+                response.setdefault(
+                    "latent_confidence_low", {}
+                )[target_column] = latent_interval["lower"].tolist()
+                response.setdefault(
+                    "latent_confidence_high", {}
+                )[target_column] = latent_interval["upper"].tolist()
 
         measured_series = []
         source_runs = load_experiment_runs(spec)

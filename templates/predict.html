@@ -148,6 +148,25 @@
             align-items: center;
             gap: 6px;
         }
+        .graph-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .graph-action {
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            padding: 9px 14px;
+            background: #fff;
+            color: #334155;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .graph-action:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
         .condition-explanation {
             grid-column: 1 / -1;
             margin: 0;
@@ -200,7 +219,7 @@
                     <option value="random_forest">ランダムフォレスト回帰</option>
                 </select>
                 <small class="input-help">
-                    GPRの予測区間は事後予測分布から計算します。他モデルはCSV単位の検証誤差を比較し、予測区間は表示しません。
+                    GPRでは曲線の信頼区間と観測ノイズ込みの予測区間を表示します。他モデルはCSV単位の検証誤差で比較します。
                 </small>
             </div>
             <p class="condition-explanation">
@@ -258,12 +277,34 @@
                     <label for="graphStyle">グラフの形</label>
                     <select id="graphStyle"></select>
                 </div>
+                <div class="input-box" id="intervalTypeGroup">
+                    <label for="intervalType">GPRの帯</label>
+                    <select id="intervalType">
+                        <option value="latent" selected>曲線の信頼区間（観測ノイズ除く）</option>
+                        <option value="predictive">将来観測の予測区間（観測ノイズ含む）</option>
+                    </select>
+                    <small class="input-help">
+                        どちらもGPRの仮定に基づく区間で、実験データでの被覆率を保証するものではありません。
+                    </small>
+                </div>
             </div>
+            <label class="graph-help" style="display:block; margin-bottom:10px;">
+                <input type="checkbox" id="showMeasuredData" checked>
+                実測データをグラフに表示
+            </label>
             <label id="compareModelsLabel" class="graph-help" style="display:block; margin-bottom:10px;">
                 <input type="checkbox" id="compareModels">
                 ほかのモデルの予測線も重ねて比較（1条件のグラフ）
             </label>
             <button type="button" class="btn-predict" id="drawGraphBtn" onclick="drawPredictionGraph()" disabled>グラフを更新</button>
+            <div class="graph-actions">
+                <button type="button" class="graph-action" id="savePredictionCsv" disabled>
+                    予測データをCSV保存
+                </button>
+                <button type="button" class="graph-action" id="saveGraphPng" disabled>
+                    グラフをPNG保存
+                </button>
+            </div>
             <div class="prediction-warning" id="graphWarning" role="alert"></div>
             <div id="predictionGraph" role="img" aria-label="実験結果の予測グラフ"></div>
         </section>
@@ -274,6 +315,7 @@
         let trainingRanges = {};
         let activeModelType = null;
         let availableExperiments = [];
+        let latestPredictionGrid = null;
 
         function selectedExperiments() {
             const selectedIds = new Set(
@@ -528,6 +570,8 @@
             const hasGprInterval =
                 activeModelType === 'gpr' ||
                 (!activeModelType && document.getElementById('modelSelect').value === 'gpr');
+            document.getElementById('intervalTypeGroup').style.display =
+                hasGprInterval ? '' : 'none';
             const graphStyles = isSurface
                 ? [
                     ['立体曲面', 'surface'],
@@ -550,6 +594,9 @@
             const graph = document.getElementById('predictionGraph');
             if (window.Plotly) Plotly.purge(graph);
             graph.replaceChildren();
+            latestPredictionGrid = null;
+            document.getElementById('savePredictionCsv').disabled = true;
+            document.getElementById('saveGraphPng').disabled = true;
             document.getElementById('graphWarning').style.display = 'none';
             document.getElementById('drawGraphBtn').disabled = !predictionAvailable;
         }
@@ -624,7 +671,7 @@
                     ? ` / CSV単位の検証: ${data.validation_runs}分割で比較`
                     : ' / CSV単位の精度検証はできていません') +
                 (data.prediction_interval
-                    ? ' / 帯はGPRの95%事後予測区間です（観測ノイズを含むガウス仮定）'
+                    ? ' / GPRは曲線の信頼区間（ノイズ除く）と将来観測の予測区間（ノイズ含む）を表示します'
                     : ' / このモデルは予測分布を算出しないため、予測区間は表示しません');
             const outOfRange = Object.entries(data.out_of_range_conditions || {});
             const warning = document.createElement('p');
@@ -635,7 +682,14 @@
             const table = document.createElement('table');
             const header = table.createTHead().insertRow();
             const predictionHeaders = data.prediction_interval
-                ? ['結果', '予測値', 'GPR予測区間（下限）', 'GPR予測区間（上限）']
+                ? [
+                    '結果',
+                    '予測値',
+                    '曲線の信頼区間（下限）',
+                    '曲線の信頼区間（上限）',
+                    '将来観測の予測区間（下限）',
+                    '将来観測の予測区間（上限）'
+                ]
                 : ['結果', '予測値'];
             predictionHeaders.forEach(text => {
                 const cell = document.createElement('th');
@@ -652,6 +706,8 @@
                 ];
                 if (data.prediction_interval) {
                     values.push(
+                        Number(data.latent_confidence_low[name]).toPrecision(6),
+                        Number(data.latent_confidence_high[name]).toPrecision(6),
                         Number(data.confidence_low[name]).toPrecision(6),
                         Number(data.confidence_high[name]).toPrecision(6)
                     );
@@ -716,6 +772,9 @@
             const drawButton = document.getElementById('drawGraphBtn');
             drawButton.disabled = true;
             drawButton.textContent = 'グラフを作成しています...';
+            latestPredictionGrid = null;
+            document.getElementById('savePredictionCsv').disabled = true;
+            document.getElementById('saveGraphPng').disabled = true;
             try {
                 const response = await fetch('/api/predict_grid', {
                     method: 'POST',
@@ -745,9 +804,21 @@
                 const style = document.getElementById('graphStyle').value;
                 const isSurface = data.y_values !== null;
                 const meanValues = data.predictions[target];
+                const intervalType = document.getElementById('intervalType').value;
                 const hasInterval = Boolean(data.prediction_interval);
-                const lowValues = hasInterval ? data.confidence_low[target] : null;
-                const highValues = hasInterval ? data.confidence_high[target] : null;
+                const intervalLabel = intervalType === 'latent'
+                    ? 'GPR 95%曲線信頼区間'
+                    : 'GPR 95%予測区間';
+                const lowValues = hasInterval
+                    ? (intervalType === 'latent'
+                        ? data.latent_confidence_low[target]
+                        : data.confidence_low[target])
+                    : null;
+                const highValues = hasInterval
+                    ? (intervalType === 'latent'
+                        ? data.latent_confidence_high[target]
+                        : data.confidence_high[target])
+                    : null;
                 const intervalWidths = hasInterval
                     ? highValues.map((value, index) => value - lowValues[index])
                     : null;
@@ -766,12 +837,14 @@
                             z: meanValues,
                             surfacecolor: hasInterval ? intervalWidths : undefined,
                             colorscale: 'Blues',
-                            colorbar: hasInterval ? { title: 'GPR予測区間幅' } : undefined,
+                            colorbar: hasInterval
+                                ? { title: `${intervalLabel}幅` }
+                                : undefined,
                             customdata: intervalCustomData,
                             hovertemplate: hasInterval
                                 ?
                                 `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
-                                `<br>${target}: %{z}<br>GPR 95%区間: ` +
+                                `<br>${target}: %{z}<br>${intervalLabel}: ` +
                                 `%{customdata[0]}～%{customdata[1]}<extra></extra>`
                                 : `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
                                     `<br>${target}: %{z}<extra></extra>`
@@ -785,6 +858,7 @@
                             z: series.target_values,
                             name: `実測: ${series.label}`,
                             marker: { size: 4, color: '#ef4444' },
+                            visible: document.getElementById('showMeasuredData').checked,
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
                                 `<br>${target}: %{z}<extra>${series.label}</extra>`
@@ -798,11 +872,13 @@
                             y: data.y_values,
                             z: uncertaintyOnly ? intervalWidths : meanValues,
                             colorscale: 'Viridis',
-                            colorbar: { title: uncertaintyOnly ? 'GPR予測区間幅' : target },
+                            colorbar: {
+                                title: uncertaintyOnly ? `${intervalLabel}幅` : target
+                            },
                             customdata: intervalCustomData,
                             hovertemplate: uncertaintyOnly
                                 ? `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
-                                    `<br>GPR予測区間幅: %{z}<br>上下限: ` +
+                                    `<br>${intervalLabel}幅: %{z}<br>上下限: ` +
                                     `%{customdata[0]}～%{customdata[1]}<extra></extra>`
                                 : `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
                                     `<br>${target}: %{z}<extra></extra>`
@@ -816,6 +892,7 @@
                             name: `実測: ${series.label}`,
                             customdata: series.target_values,
                             marker: { size: 8, color: '#ef4444' },
+                            visible: document.getElementById('showMeasuredData').checked,
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
                                 `<br>${target}: %{customdata}<extra>${series.label}</extra>`
@@ -835,7 +912,7 @@
                         ]);
                         barTrace.hovertemplate =
                             `${data.x_column}: %{x}<br>${target}: %{y}` +
-                            `<br>GPR 95%予測区間: %{customdata[0]}～` +
+                            `<br>${intervalLabel}: %{customdata[0]}～` +
                             `%{customdata[1]}<extra></extra>`;
                         barTrace.error_y = {
                             type: 'data',
@@ -853,6 +930,7 @@
                             x: series.x_values,
                             y: series.target_values,
                             name: `実測: ${series.label}`,
+                            visible: document.getElementById('showMeasuredData').checked,
                             marker: { color: '#ef4444', size: 7 },
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${target}: %{y}` +
@@ -881,7 +959,7 @@
                             line: { width: 0 },
                             fill: 'tonexty',
                             fillcolor: 'rgba(59,130,246,0.2)',
-                            name: 'GPR 95%予測区間',
+                            name: intervalLabel,
                             hoverinfo: 'skip'
                             }
                         );
@@ -899,7 +977,7 @@
                             hovertemplate: hasInterval
                                 ?
                                 `${data.x_column}: %{x}<br>${target}: %{y}` +
-                                `<br>GPR 95%予測区間: %{customdata[0]}～` +
+                                `<br>${intervalLabel}: %{customdata[0]}～` +
                                 `%{customdata[1]}<extra></extra>`
                                 : `${data.x_column}: %{x}<br>${target}: %{y}<extra></extra>`
                     });
@@ -910,6 +988,7 @@
                             x: series.x_values,
                             y: series.target_values,
                             name: `実測: ${series.label}`,
+                            visible: document.getElementById('showMeasuredData').checked,
                             marker: { color: '#ef4444', size: 7 },
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${target}: %{y}` +
@@ -926,7 +1005,7 @@
                     .join('、');
                 const layout = {
                     title: hasInterval
-                        ? `${target} のGPR予測と95%事後予測区間（${axisDescription}）`
+                        ? `${target} のGPR予測と${intervalLabel}（${axisDescription}）`
                         : `${target} の予測と実測データ（${axisDescription}）`,
                     autosize: true,
                     margin: { l: 60, r: 30, t: 60, b: 60 },
@@ -946,6 +1025,9 @@
                     layout,
                     { responsive: true, displaylogo: false }
                 );
+                latestPredictionGrid = { data, target, intervalType };
+                document.getElementById('savePredictionCsv').disabled = false;
+                document.getElementById('saveGraphPng').disabled = false;
                 const outOfRange = [
                     ...Object.keys(data.out_of_range_conditions || {}),
                     ...Object.keys(data.out_of_range_axes || {})
@@ -968,7 +1050,10 @@
                     : '';
                 document.getElementById('graphHelp').textContent =
                     `選択した${data.experiment_ids.length}件 / ${data.total_points}行から` +
-                    `${data.training_points}点で予測・実測点を重ねて表示` +
+                    `${data.training_points}点で予測` +
+                    (document.getElementById('showMeasuredData').checked
+                        ? '・実測点を重ねて表示'
+                        : '（実測点は非表示）') +
                     (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '') +
                     (outOfRange.length
                         ? ` / 注意: ${[...new Set(outOfRange)].join('、')}は学習範囲外です。`
@@ -978,6 +1063,117 @@
             } finally {
                 drawButton.disabled = !predictionAvailable;
                 drawButton.textContent = 'グラフを更新';
+            }
+        }
+
+        function csvCell(value) {
+            return `"${String(value ?? '').replace(/"/g, '""')}"`;
+        }
+
+        function downloadPredictionCsv() {
+            if (!latestPredictionGrid) return;
+            const { data } = latestPredictionGrid;
+            const isSurface = data.y_values !== null;
+            const headers = [...data.input_columns];
+            data.target_columns.forEach(target => {
+                headers.push(`${target}_予測値`);
+                if (data.confidence_interval) {
+                    headers.push(
+                        `${target}_曲線信頼区間下限`,
+                        `${target}_曲線信頼区間上限`
+                    );
+                }
+                if (data.prediction_interval) {
+                    headers.push(
+                        `${target}_将来観測予測区間下限`,
+                        `${target}_将来観測予測区間上限`
+                    );
+                }
+            });
+            headers.push('使用モデル', '学習点数', 'CSV数');
+            const rows = [headers];
+            const rowCount = isSurface ? data.y_values.length : data.x_values.length;
+            const columnCount = isSurface ? data.x_values.length : 1;
+            for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+                for (let columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+                    const xIndex = isSurface ? columnIndex : rowIndex;
+                    const yValue = isSurface ? data.y_values[rowIndex] : null;
+                    const row = data.input_columns.map(column => {
+                        if (column === data.x_column) return data.x_values[xIndex];
+                        if (isSurface && column === data.y_column) return yValue;
+                        return data.fixed_conditions[column];
+                    });
+                    const getGridValue = values => isSurface
+                        ? values[rowIndex][columnIndex]
+                        : values[rowIndex];
+                    data.target_columns.forEach(target => {
+                        row.push(getGridValue(data.predictions[target]));
+                        if (data.confidence_interval) {
+                            row.push(
+                                getGridValue(data.latent_confidence_low[target]),
+                                getGridValue(data.latent_confidence_high[target])
+                            );
+                        }
+                        if (data.prediction_interval) {
+                            row.push(
+                                getGridValue(data.confidence_low[target]),
+                                getGridValue(data.confidence_high[target])
+                            );
+                        }
+                    });
+                    row.push(
+                        data.model_label,
+                        data.training_points,
+                        data.training_run_count
+                    );
+                    rows.push(row);
+                }
+            }
+            const csv = '\uFEFF' + rows
+                .map(row => row.map(csvCell).join(','))
+                .join('\r\n');
+            const url = URL.createObjectURL(
+                new Blob([csv], { type: 'text/csv;charset=utf-8' })
+            );
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `predicted_data_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+            document.body.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        async function downloadPredictionGraph() {
+            if (!latestPredictionGrid || !window.Plotly) return;
+            try {
+                await Plotly.downloadImage(
+                    document.getElementById('predictionGraph'),
+                    {
+                        format: 'png',
+                        filename: 'prediction_graph',
+                        width: 1600,
+                        height: 1000,
+                        scale: 2
+                    }
+                );
+            } catch (error) {
+                alert(`画像の保存に失敗しました: ${error.message}`);
+            }
+        }
+
+        function toggleMeasuredData() {
+            const graph = document.getElementById('predictionGraph');
+            if (!graph.data || !window.Plotly) return;
+            const traceIndexes = graph.data
+                .map((trace, index) => trace.name?.startsWith('実測:') ? index : -1)
+                .filter(index => index >= 0);
+            if (traceIndexes.length) {
+                Plotly.restyle(
+                    graph,
+                    { visible: document.getElementById('showMeasuredData').checked },
+                    traceIndexes
+                );
             }
         }
 
@@ -995,6 +1191,21 @@
             'click',
             selectCompatibleDatasets
         );
+        document.getElementById('savePredictionCsv').addEventListener(
+            'click',
+            downloadPredictionCsv
+        );
+        document.getElementById('saveGraphPng').addEventListener(
+            'click',
+            downloadPredictionGraph
+        );
+        document.getElementById('showMeasuredData').addEventListener(
+            'change',
+            toggleMeasuredData
+        );
+        document.getElementById('intervalType').addEventListener('change', () => {
+            if (predictionAvailable) drawPredictionGraph();
+        });
         document.getElementById('modelSelect').addEventListener('change', () => {
             document.getElementById('predictionResults').replaceChildren();
             predictionAvailable = false;
