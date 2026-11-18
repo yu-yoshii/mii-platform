@@ -1551,6 +1551,8 @@ def predict_dynamic():
         return {
             "experiment_id": str(spec["_id"]),
             "experiment_ids": spec["source_ids"],
+            "input_columns": input_columns,
+            "target_columns": target_columns,
             "training_run_count": spec["run_count"],
             "training_points": requested_points,
             "total_points": point_total,
