@@ -200,6 +200,7 @@ class ExperimentCsvTests(unittest.TestCase):
         experiment = response.json["experiments"][0]
         self.assertEqual(experiment["id"], str(spec["_id"]))
         self.assertEqual(experiment["point_count"], 5)
+        self.assertFalse(experiment["can_append"])
 
     def test_creates_experiment_with_selected_numeric_columns(self):
         app_module.db = SimpleNamespace(
@@ -230,6 +231,23 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(experiment["run_count"], 1)
         self.assertIn(experiment["runs"][0]["csv_file_id"], app_module.fs.files)
 
+        invalid_append = app_module.app.test_client().post(
+            "/api/experiments",
+            data={
+                "file": (io.BytesIO(
+                    b"temperature,field,permeability,loss\n"
+                    b"25,6,7,0.6\n26,7,8,0.7\n27,8,9,0.8\n"
+                    b"28,9,10,0.9\n29,10,11,1.0\n"
+                ), "wrong-columns.csv"),
+                "existing_experiment_id": str(experiment["_id"]),
+                "input_columns": '["temperature"]',
+                "target_columns": '["permeability", "loss"]'
+            },
+            content_type="multipart/form-data"
+        )
+        self.assertEqual(invalid_append.status_code, 400)
+        self.assertEqual(len(experiment["runs"]), 1)
+
         listed = app_module.app.test_client().get("/api/experiments")
         self.assertEqual(listed.status_code, 200)
         listed_experiment = listed.json["experiments"][0]
@@ -237,7 +255,30 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(listed_experiment["input_columns"], ["temperature", "field"])
         self.assertEqual(listed_experiment["target_columns"], ["permeability", "loss"])
         self.assertEqual(listed_experiment["point_count"], 5)
+        self.assertTrue(listed_experiment["can_append"])
         self.assertIn("run_id", response.json)
+
+        appended = app_module.app.test_client().post(
+            "/api/experiments",
+            data={
+                "file": (io.BytesIO(
+                    b"temperature,field,permeability,loss\n"
+                    b"25,6,7,0.6\n26,7,8,0.7\n27,8,9,0.8\n"
+                    b"28,9,10,0.9\n29,10,11,1.0\n"
+                ), "additional.csv"),
+                "existing_experiment_id": response.json["id"],
+                "project_name": "should be ignored",
+                "input_columns": '["field", "temperature"]',
+                "target_columns": '["permeability", "loss"]'
+            },
+            content_type="multipart/form-data"
+        )
+        self.assertEqual(appended.status_code, 201)
+        self.assertEqual(appended.json["id"], response.json["id"])
+        self.assertEqual(appended.json["row_count"], 10)
+        self.assertEqual(appended.json["run_count"], 2)
+        self.assertEqual(len(experiment["runs"]), 2)
+        self.assertEqual(experiment["project_name"], "未分類")
 
     def test_run_graph_api_loads_a_single_csv(self):
         file_id = ObjectId()

@@ -219,7 +219,7 @@
                     <option value="random_forest">ランダムフォレスト回帰</option>
                 </select>
                 <small class="input-help">
-                    GPRでは曲線の信頼区間と観測ノイズ込みの予測区間を表示します。他モデルはCSV単位の検証誤差で比較します。
+                    GPRでは2種類の区間を表示します。2次多項式は正則化を自動調整し、ランダムフォレストは学習範囲外の予測には不向きです。
                 </small>
             </div>
             <p class="condition-explanation">
@@ -676,8 +676,12 @@
             const outOfRange = Object.entries(data.out_of_range_conditions || {});
             const warning = document.createElement('p');
             warning.style.cssText = 'color:#b45309; background:#fff7ed; padding:10px; border-radius:8px;';
+            const randomForestExtrapolationWarning =
+                data.model_type === 'random_forest' && outOfRange.length
+                    ? ' ランダムフォレストは学習範囲外へ外挿できないため、この予測には適しません。'
+                    : '';
             warning.textContent = outOfRange.length
-                ? `注意: ${outOfRange.map(([name, value]) => `${name}=${value}`).join('、')}は学習した範囲外です。外挿のため予測の不確かさが高く、結果を保証するものではありません。`
+                ? `注意: ${outOfRange.map(([name, value]) => `${name}=${value}`).join('、')}は学習した範囲外です。外挿のため予測の不確かさが高く、結果を保証するものではありません。${randomForestExtrapolationWarning}`
                 : '表の範囲は、登録データの条件内で予測した結果です。';
             const table = document.createElement('table');
             const header = table.createTHead().insertRow();
@@ -731,12 +735,16 @@
                 row.insertCell().textContent =
                     `${(candidate.normalized_rmse * 100).toPrecision(4)}%`;
             });
+            const evaluationHelp = document.createElement('p');
+            evaluationHelp.className = 'graph-help';
+            evaluationHelp.textContent =
+                '検証ではCSVを1件ずつ学習から外します。未経験の条件を含む場合は誤差が大きくなりやすく、条件の異なるCSVを増やすとモデル比較が安定します。';
             container.replaceChildren(
                 summary,
                 modelSummary,
                 warning,
                 table,
-                ...(data.model_evaluation?.length ? [evaluation] : [])
+                ...(data.model_evaluation?.length ? [evaluationHelp, evaluation] : [])
             );
         }
 
@@ -1046,7 +1054,10 @@
                 graphWarning.style.display = outOfRange.length ? 'block' : 'none';
                 graphWarning.textContent = outOfRange.length
                     ? `学習データの範囲外です（${warningDetails.join('、')}）。` +
-                        '外挿の予測は不確かで、表示される区間も正しさを保証しません。'
+                        '外挿の予測は不確かで、表示される区間も正しさを保証しません。' +
+                        (activeModelType === 'random_forest'
+                            ? ' ランダムフォレストは範囲外へ外挿できないため、この予測には適しません。'
+                            : '')
                     : '';
                 document.getElementById('graphHelp').textContent =
                     `選択した${data.experiment_ids.length}件 / ${data.total_points}行から` +

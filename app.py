@@ -35,7 +35,7 @@ from openpyxl.chart import ScatterChart, Series, Reference
 # プログラムから綺麗なエクセルファイルを制作したりグラフを自動で書かせたりするための道具
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.preprocessing import StandardScaler
@@ -256,15 +256,19 @@ def fit_experiment_candidate(
         }
     if model_type == "polynomial":
         polynomial = PolynomialFeatures(degree=2, include_bias=False)
-        features = polynomial.fit_transform(scaled_values)
+        feature_scaler = StandardScaler()
+        features = feature_scaler.fit_transform(
+            polynomial.fit_transform(scaled_values)
+        )
         target_scaler = StandardScaler()
         scaled_targets = target_scaler.fit_transform(target_values)
-        estimator = Ridge(alpha=1.0)
+        estimator = RidgeCV(alphas=np.logspace(-4, 4, 17))
         estimator.fit(features, scaled_targets)
         return {
             "type": model_type,
             "scaler": scaler,
             "polynomial": polynomial,
+            "feature_scaler": feature_scaler,
             "target_scaler": target_scaler,
             "estimator": estimator
         }
@@ -302,7 +306,9 @@ def predict_experiment_candidate(model, input_values):
             mean = mean.reshape(-1, 1)
         return mean, None
 
-    features = model["polynomial"].transform(scaled_values)
+    features = model["feature_scaler"].transform(
+        model["polynomial"].transform(scaled_values)
+    )
     scaled_mean = model["estimator"].predict(features)
     mean = model["target_scaler"].inverse_transform(
         np.asarray(scaled_mean).reshape(len(input_values), -1)
@@ -961,7 +967,8 @@ def list_experiments():
                     "input_columns": group.get("input_columns", []),
                     "target_columns": group.get("target_columns", []),
                     "point_count": group.get("row_count", 0),
-                    "run_count": group.get("run_count", len(group.get("runs", [])))
+                    "run_count": group.get("run_count", len(group.get("runs", []))),
+                    "can_append": True
                 })
 
         for spec in db.spectrums.find().sort("date", -1):
@@ -983,7 +990,8 @@ def list_experiments():
                 "input_columns": input_columns,
                 "target_columns": target_columns,
                 "point_count": point_count,
-                "run_count": 1
+                "run_count": 1,
+                "can_append": False
             })
         return {"experiments": experiments}
     except Exception:
@@ -1089,13 +1097,29 @@ def create_experiment():
             or "実験データ"
         )
         groups = db.experiment_groups
+        existing_experiment_id = request.form.get(
+            "existing_experiment_id", ""
+        ).strip()
+        if existing_experiment_id:
+            if not ObjectId.is_valid(existing_experiment_id):
+                return {"error": "追加先の実験セットを選び直してください。"}, 400
+            group = groups.find_one({"_id": ObjectId(existing_experiment_id)})
+            if not group:
+                return {"error": "追加先の実験セットが見つかりません。"}, 404
+            project_name = group.get("project_name", "未分類")
+            material_name = group.get("material_name", "名称不明")
+            domain = group.get("domain", "未分類")
+            experiment_name = group.get("experiment_name", "実験データ")
+        else:
+            group = None
         group_filter = {
             "project_name": project_name,
             "material_name": material_name,
             "domain": domain,
             "experiment_name": experiment_name
         }
-        group = groups.find_one(group_filter)
+        if group is None:
+            group = groups.find_one(group_filter)
         if group:
             if (
                 set(input_columns) != set(group.get("input_columns", []))

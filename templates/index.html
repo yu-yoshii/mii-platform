@@ -299,6 +299,15 @@
 
         <h3>📈 汎用実験CSVデータ送信</h3>
         <div class="input-group">
+            <label for="csv_existing_group">既存の実験セットに追加（任意）</label>
+            <select id="csv_existing_group">
+                <option value="">新しい実験セットを作成</option>
+            </select>
+            <small id="csv_existing_group_status" style="display:block; color:#64748b; margin-top:5px;">
+                既存セットを選ぶと、名前・条件列・結果列を自動で引き継ぎます。
+            </small>
+        </div>
+        <div class="input-group">
             <label>実験名 (プロジェクト名)</label>
             <input type="text" id="csv_project_name" placeholder="例: 実験1">
         </div>
@@ -379,6 +388,8 @@
         let isNewest = false;
         let myChart = null; 
         let currentGraphData = null;
+        let existingExperimentSets = [];
+        let newExperimentMetadata = null;
         const previousColumnRoles = new Map();
 
         socket.on('connect', () => {
@@ -417,6 +428,85 @@
             fileInput.value = '';
         }
 
+        function selectedExistingExperimentSet() {
+            return existingExperimentSets.find(
+                experiment => experiment.id === document.getElementById('csv_existing_group').value
+            ) || null;
+        }
+
+        async function loadExistingExperimentSets(selectedId = '') {
+            const select = document.getElementById('csv_existing_group');
+            const status = document.getElementById('csv_existing_group_status');
+            try {
+                const response = await fetch('/api/experiments');
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || '既存セットを読み込めませんでした。');
+                }
+                existingExperimentSets = (result.experiments || []).filter(
+                    experiment => experiment.can_append
+                );
+                select.replaceChildren(
+                    new Option('新しい実験セットを作成', ''),
+                    ...existingExperimentSets.map(experiment => new Option(
+                        `${experiment.experiment_name} / ${experiment.material_name} / ` +
+                        `${experiment.project_name} / ${experiment.domain} ` +
+                        `(${experiment.run_count}件・${experiment.point_count}行)`,
+                        experiment.id
+                    ))
+                );
+                select.value = existingExperimentSets.some(
+                    experiment => experiment.id === selectedId
+                ) ? selectedId : '';
+                status.textContent = existingExperimentSets.length
+                    ? '選択すると名前と条件・結果列の設定を引き継いで、同じセットにCSVを追加します。'
+                    : '追加できる既存セットはありません。新しいセットを作成してください。';
+            } catch (error) {
+                existingExperimentSets = [];
+                select.replaceChildren(new Option('新しい実験セットを作成', ''));
+                status.textContent = `既存セットを読み込めませんでした: ${error.message}`;
+            }
+        }
+
+        async function applyExistingExperimentSet() {
+            const experiment = selectedExistingExperimentSet();
+            const fields = {
+                project_name: document.getElementById('csv_project_name'),
+                material_name: document.getElementById('csv_material_name'),
+                domain: document.getElementById('csv_domain'),
+                experiment_name: document.getElementById('csv_experiment_name')
+            };
+            if (experiment && !newExperimentMetadata) {
+                newExperimentMetadata = Object.fromEntries(
+                    Object.entries(fields).map(([key, input]) => [key, input.value])
+                );
+            }
+            Object.entries(fields).forEach(([key, input]) => {
+                input.disabled = Boolean(experiment);
+                if (experiment) {
+                    input.value = experiment[key] || '';
+                } else if (newExperimentMetadata) {
+                    input.value = newExperimentMetadata[key];
+                }
+            });
+            if (experiment) {
+                previousColumnRoles.clear();
+                experiment.input_columns.forEach(
+                    column => previousColumnRoles.set(column, 'input')
+                );
+                experiment.target_columns.forEach(
+                    column => previousColumnRoles.set(column, 'target')
+                );
+            } else {
+                newExperimentMetadata = null;
+            }
+            if (document.getElementById('csv_file').files.length) {
+                await previewCSV();
+            } else {
+                updateCsvRoleValidity();
+            }
+        }
+
         async function previewCSV() {
             const fileInput = document.getElementById('csv_file');
             const roleEditor = document.getElementById('csv_role_editor');
@@ -452,7 +542,16 @@
                         ['input', '条件（入力）'],
                         ['target', '結果（予測）']
                     ].forEach(([value, text]) => select.add(new Option(text, value)));
-                    select.value = previousColumnRoles.get(column) || 'ignore';
+                    const existingExperiment = selectedExistingExperimentSet();
+                    const existingRole = existingExperiment
+                        ? existingExperiment.input_columns.includes(column)
+                            ? 'input'
+                            : existingExperiment.target_columns.includes(column)
+                                ? 'target'
+                                : 'ignore'
+                        : null;
+                    select.value = existingRole || previousColumnRoles.get(column) || 'ignore';
+                    select.disabled = Boolean(existingExperiment);
                     select.addEventListener('change', () => {
                         previousColumnRoles.set(column, select.value);
                         updateCsvRoleValidity();
@@ -485,13 +584,37 @@
 
         function updateCsvRoleValidity() {
             const roles = [...document.querySelectorAll('#csv_column_roles select')];
-            const inputCount = roles.filter(select => select.value === 'input').length;
-            const targetCount = roles.filter(select => select.value === 'target').length;
+            const inputColumns = roles
+                .filter(select => select.value === 'input')
+                .map(select => select.dataset.column);
+            const targetColumns = roles
+                .filter(select => select.value === 'target')
+                .map(select => select.dataset.column);
+            const experiment = selectedExistingExperimentSet();
+            const sameColumns = (selected, expected) =>
+                selected.length === expected.length &&
+                expected.every(column => selected.includes(column));
+            const compatible = !experiment || (
+                sameColumns(inputColumns, experiment.input_columns) &&
+                sameColumns(targetColumns, experiment.target_columns)
+            );
+            const status = document.getElementById('csv_existing_group_status');
+            if (experiment && !compatible) {
+                status.textContent =
+                    'このCSVの列が既存セットと一致しません。列名を確認するか、新しいセットを選んでください。';
+            } else if (experiment) {
+                status.textContent =
+                    `追加先: ${experiment.experiment_name}。条件列と結果列は既存セットの設定を使用します。`;
+            } else {
+                status.textContent =
+                    '既存セットを選ぶと、名前・条件列・結果列を自動で引き継ぎます。';
+            }
             document.getElementById('save_csv_button').disabled =
                 document.getElementById('csv_file').files.length === 0 ||
                 !document.getElementById('csv_experiment_name').value.trim() ||
-                inputCount === 0 ||
-                targetCount === 0;
+                inputColumns.length === 0 ||
+                targetColumns.length === 0 ||
+                !compatible;
         }
 
         async function sendCSV() {
@@ -518,6 +641,10 @@
             formData.append('experiment_name', experimentName);
             formData.append('input_columns', JSON.stringify(inputColumns));
             formData.append('target_columns', JSON.stringify(targetColumns));
+            formData.append(
+                'existing_experiment_id',
+                document.getElementById('csv_existing_group').value
+            );
 
             const saveButton = document.getElementById('save_csv_button');
             saveButton.disabled = true;
@@ -529,6 +656,7 @@
                 socket.emit('load messages');
                 fileInput.value = '';
                 document.getElementById('csv_role_editor').style.display = 'none';
+                await loadExistingExperimentSets(result.id);
                 alert(
                     `${result.added_row_count}行を追加しました。` +
                     `セット合計: ${result.row_count}行 / ${result.run_count}件のCSV`
@@ -819,6 +947,11 @@
             document.getElementById('sort_btn').innerText = isNewest ? "古い順" : "新しい順";
             updateUI(); 
         };
+        document.getElementById('csv_existing_group').addEventListener(
+            'change',
+            applyExistingExperimentSet
+        );
+        loadExistingExperimentSets();
     </script>
 </body>
 </html>
