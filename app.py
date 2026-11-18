@@ -43,6 +43,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 MAX_GPR_TRAINING_POINTS = 1000
 DEFAULT_GPR_TRAINING_POINTS = 250
+MIN_EXPERIMENT_POINTS = 5
 
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20000000)
 
@@ -156,7 +157,7 @@ def parse_csv_table(csv_bytes):
 
     return headers, rows
 
-def parse_numeric_columns(headers, rows, input_columns, target_columns):
+def parse_numeric_columns(headers, rows, input_columns, target_columns, minimum_rows=5):
     if not isinstance(input_columns, list) or not isinstance(target_columns, list):
         raise ValueError("条件列と結果列を選択してください。")
     if not input_columns or not target_columns:
@@ -182,8 +183,8 @@ def parse_numeric_columns(headers, rows, input_columns, target_columns):
             raise ValueError(f"{row_number}行目に無限大または無効な数値があります。")
         numeric_rows.append(values)
 
-    if len(numeric_rows) < 5:
-        raise ValueError("機械学習には5行以上の測定データが必要です。")
+    if len(numeric_rows) < minimum_rows:
+        raise ValueError(f"測定データには{minimum_rows}行以上必要です。")
 
     values = np.asarray(numeric_rows, dtype=float)
     return values[:, :len(input_columns)], values[:, len(input_columns):]
@@ -192,9 +193,30 @@ def select_evenly_spaced_rows(input_values, target_values, row_count):
     indices = np.linspace(0, len(input_values) - 1, num=row_count, dtype=int)
     return np.asarray(input_values)[indices], np.asarray(target_values)[indices]
 
+def resolve_axis_range(requested_range, axis_values):
+    observed_min = float(np.min(axis_values))
+    observed_max = float(np.max(axis_values))
+    if requested_range is None:
+        return observed_min, observed_max
+    if not isinstance(requested_range, list) or len(requested_range) != 2:
+        raise ValueError("グラフの範囲は最小値と最大値を指定してください。")
+    if any(isinstance(value, bool) for value in requested_range):
+        raise ValueError("グラフの範囲は数値で指定してください。")
+    try:
+        low, high = map(float, requested_range)
+    except (TypeError, ValueError) as error:
+        raise ValueError("グラフの範囲は数値で指定してください。") from error
+    if not np.isfinite(low) or not np.isfinite(high) or low >= high:
+        raise ValueError("グラフ範囲の最小値は最大値より小さくしてください。")
+    return low, high
+
 def get_experiment_model(spec, input_columns, target_columns, input_values, target_values, requested_points):
+    source_files = tuple(
+        str(run["csv_file_id"]) for run in spec.get("runs", [])
+    ) or (str(spec.get("csv_file_id", "legacy")),)
     cache_key = (
         str(spec["_id"]),
+        source_files,
         tuple(input_columns),
         tuple(target_columns),
         requested_points
@@ -229,9 +251,12 @@ def get_experiment_model(spec, input_columns, target_columns, input_values, targ
 def load_experiment_table(spec):
     input_columns = spec.get("input_columns")
     target_columns = spec.get("target_columns")
+    source_files = tuple(
+        str(run["csv_file_id"]) for run in spec.get("runs", [])
+    ) or (str(spec.get("csv_file_id", "legacy")),)
     cache_key = (
         str(spec["_id"]),
-        str(spec.get("csv_file_id", "legacy")),
+        source_files,
         tuple(input_columns or []),
         tuple(target_columns or []),
         spec.get("x_label"),
@@ -240,7 +265,21 @@ def load_experiment_table(spec):
     if experiment_table_cache["cache_key"] == cache_key:
         return experiment_table_cache["table"]
 
-    if input_columns and target_columns and spec.get("csv_file_id"):
+    if input_columns and target_columns and spec.get("runs"):
+        input_tables = []
+        target_tables = []
+        for run in spec["runs"]:
+            csv_bytes = fs.get(run["csv_file_id"]).read()
+            headers, rows = parse_csv_table(csv_bytes)
+            input_values, target_values = parse_numeric_columns(
+                headers, rows, input_columns, target_columns, minimum_rows=1
+            )
+            input_tables.append(input_values)
+            target_tables.append(target_values)
+        input_values = np.concatenate(input_tables, axis=0)
+        target_values = np.concatenate(target_tables, axis=0)
+        table = (input_columns, target_columns, input_values, target_values)
+    elif input_columns and target_columns and spec.get("csv_file_id"):
         csv_bytes = fs.get(spec["csv_file_id"]).read()
         headers, rows = parse_csv_table(csv_bytes)
         input_values, target_values = parse_numeric_columns(
@@ -261,6 +300,14 @@ def load_experiment_table(spec):
     experiment_table_cache["cache_key"] = cache_key
     experiment_table_cache["table"] = table
     return table
+
+def find_experiment(experiment_id):
+    group_collection = getattr(db, "experiment_groups", None)
+    if group_collection is not None:
+        group = group_collection.find_one({"_id": experiment_id})
+        if group:
+            return group
+    return db.spectrums.find_one({"_id": experiment_id})
 
 def get_image_data(image_id):
     try:
@@ -340,6 +387,40 @@ def load_messages():
                 'wavelengths': x_vals,
                 'intensities': y_vals
             })
+
+        groups = getattr(db, "experiment_groups", None)
+        if groups is not None:
+            for group in groups.find().sort("date", -1).limit(50):
+                input_columns = group.get("input_columns", [])
+                target_columns = group.get("target_columns", [])
+                row_count = group.get("row_count", 0)
+                run_count = group.get("run_count", len(group.get("runs", [])))
+                combined_timeline.append({
+                    "id": str(group["_id"]),
+                    "date": group.get("date", datetime.now()),
+                    "project_name": group.get("project_name", "未分類"),
+                    "material_name": group.get("material_name", "名称不明"),
+                    "domain": group.get("domain", "未分類"),
+                    "experiment_name": group.get("experiment_name", "実験データ"),
+                    "message": (
+                        f"【{group.get('domain', '実験データ')}】{run_count}件のCSV"
+                        f" / {row_count}行 / 条件: {', '.join(input_columns)}"
+                        f" / 結果: {', '.join(target_columns)}"
+                    ),
+                    "h_val": "N/A", "s_val": "N/A", "v_val": "N/A",
+                    "image_data": "",
+                    "type": "csv",
+                    "row_count": row_count,
+                    "run_count": run_count,
+                    "input_columns": input_columns,
+                    "target_columns": target_columns,
+                    "x_label": ", ".join(input_columns),
+                    "y_label": ", ".join(target_columns),
+                    "x_values": [],
+                    "y_values": [],
+                    "wavelengths": [],
+                    "intensities": []
+                })
             
         combined_timeline.sort(key=lambda x: x['date'])
         
@@ -397,6 +478,23 @@ def send_message(data):
 def list_experiments():
     try:
         experiments = []
+        groups = getattr(db, "experiment_groups", None)
+        if groups is not None:
+            for group in groups.find().sort("date", -1):
+                date = group.get("date")
+                experiments.append({
+                    "id": str(group["_id"]),
+                    "experiment_name": group.get("experiment_name", "実験データ"),
+                    "project_name": group.get("project_name", "未分類"),
+                    "material_name": group.get("material_name", "名称不明"),
+                    "domain": group.get("domain", "未分類"),
+                    "date": date.isoformat() if isinstance(date, datetime) else str(date or ""),
+                    "input_columns": group.get("input_columns", []),
+                    "target_columns": group.get("target_columns", []),
+                    "point_count": group.get("row_count", 0),
+                    "run_count": group.get("run_count", len(group.get("runs", [])))
+                })
+
         for spec in db.spectrums.find().sort("date", -1):
             input_columns = spec.get("input_columns")
             target_columns = spec.get("target_columns")
@@ -408,13 +506,15 @@ def list_experiments():
             date = spec.get("date")
             experiments.append({
                 "id": str(spec["_id"]),
+                "experiment_name": spec.get("material_name", "旧形式の実験"),
                 "project_name": spec.get("project_name", "未分類"),
                 "material_name": spec.get("material_name", "名称不明"),
                 "domain": spec.get("domain", "未分類"),
                 "date": date.isoformat() if isinstance(date, datetime) else str(date or ""),
                 "input_columns": input_columns,
                 "target_columns": target_columns,
-                "point_count": point_count
+                "point_count": point_count,
+                "run_count": 1
             })
         return {"experiments": experiments}
     except Exception:
@@ -444,39 +544,95 @@ def create_experiment():
         headers, rows = parse_csv_table(csv_bytes)
         input_columns = json.loads(request.form.get("input_columns", "[]"))
         target_columns = json.loads(request.form.get("target_columns", "[]"))
-        input_values, target_values = parse_numeric_columns(
-            headers, rows, input_columns, target_columns
+        if not isinstance(input_columns, list) or not isinstance(target_columns, list):
+            return {"error": "条件列と結果列を選択してください。"}, 400
+        if any(not isinstance(column, str) for column in input_columns + target_columns):
+            return {"error": "列名の指定が正しくありません。"}, 400
+        project_name = request.form.get("project_name", "未分類").strip() or "未分類"
+        material_name = request.form.get("material_name", "名称不明").strip() or "名称不明"
+        domain = request.form.get("domain", "未分類").strip() or "未分類"
+        experiment_name = (
+            request.form.get("experiment_name", "").strip()
+            or Path(uploaded_file.filename).stem
+            or "実験データ"
         )
+        groups = db.experiment_groups
+        group_filter = {
+            "project_name": project_name,
+            "material_name": material_name,
+            "domain": domain,
+            "experiment_name": experiment_name
+        }
+        group = groups.find_one(group_filter)
+        if group:
+            if (
+                set(input_columns) != set(group.get("input_columns", []))
+                or set(target_columns) != set(group.get("target_columns", []))
+            ):
+                return {
+                    "error": (
+                        "同じ実験セットに追加するCSVは、条件列と結果列を"
+                        "前回と同じにしてください。"
+                    )
+                }, 400
+            input_columns = group["input_columns"]
+            target_columns = group["target_columns"]
 
-        experiment_id = ObjectId()
+        input_values, _ = parse_numeric_columns(
+            headers, rows, input_columns, target_columns, minimum_rows=1
+        )
+        experiment_id = group["_id"] if group else ObjectId()
         file_id = fs.put(
             csv_bytes,
             filename=uploaded_file.filename,
             content_type="text/csv",
             metadata={"experiment_id": str(experiment_id), "kind": "experiment_data"}
         )
+        run = {
+            "csv_file_id": file_id,
+            "csv_filename": uploaded_file.filename,
+            "row_count": len(input_values),
+            "date": datetime.now()
+        }
         try:
-            db.spectrums.insert_one({
-                "_id": experiment_id,
-                "project_name": request.form.get("project_name", "未分類"),
-                "material_name": request.form.get("material_name", "名称不明"),
-                "domain": request.form.get("domain", "未分類"),
-                "csv_filename": uploaded_file.filename,
-                "csv_file_id": file_id,
-                "input_columns": input_columns,
-                "target_columns": target_columns,
-                "row_count": len(input_values),
-                "date": datetime.now()
-            })
+            if group:
+                total_rows = group.get("row_count", 0) + len(input_values)
+                run_count = group.get("run_count", 1) + 1
+                updated = groups.update_one(
+                    {"_id": experiment_id},
+                    {
+                        "$push": {"runs": run},
+                        "$inc": {"row_count": len(input_values), "run_count": 1},
+                        "$set": {"date": run["date"]}
+                    }
+                )
+                if updated.matched_count != 1:
+                    raise RuntimeError("実験セットが更新中に見つからなくなりました。")
+            else:
+                groups.insert_one({
+                    "_id": experiment_id,
+                    **group_filter,
+                    "input_columns": input_columns,
+                    "target_columns": target_columns,
+                    "runs": [run],
+                    "row_count": len(input_values),
+                    "run_count": 1,
+                    "date": run["date"]
+                })
+                total_rows = len(input_values)
+                run_count = 1
         except Exception:
             fs.delete(file_id)
             raise
 
         return {
             "id": str(experiment_id),
+            "experiment_name": experiment_name,
             "input_columns": input_columns,
             "target_columns": target_columns,
-            "row_count": len(input_values)
+            "row_count": total_rows,
+            "added_row_count": len(input_values),
+            "run_count": run_count
         }, 201
     except (UnicodeDecodeError, csv.Error, ValueError, json.JSONDecodeError) as error:
         return {"error": str(error)}, 400
@@ -561,6 +717,22 @@ def delete_message(data):
         if target_image:
             fs.delete(target_image['image_id'])
             db.images.delete_one({"_id": ObjectId(msg_id)})
+            emit('message deleted', {'id': msg_id}, broadcast=True)
+            return
+
+        groups = getattr(db, "experiment_groups", None)
+        target_group = (
+            groups.find_one({"_id": ObjectId(msg_id)})
+            if groups is not None else None
+        )
+        if target_group:
+            for run in target_group.get("runs", []):
+                fs.delete(run["csv_file_id"])
+            groups.delete_one({"_id": ObjectId(msg_id)})
+            if experiment_table_cache["cache_key"] and experiment_table_cache["cache_key"][0] == msg_id:
+                experiment_table_cache.update({"cache_key": None, "table": None})
+            if model_cache["cache_key"] and model_cache["cache_key"][0] == msg_id:
+                model_cache.update({"cache_key": None, "scaler": None, "gp_model": None})
             emit('message deleted', {'id': msg_id}, broadcast=True)
             return
 
@@ -752,14 +924,14 @@ def predict_dynamic():
         if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
             return {"error": "学習対象の実験を選択してください。"}, 400
 
-        spec = db.spectrums.find_one({"_id": ObjectId(experiment_id)})
+        spec = find_experiment(ObjectId(experiment_id))
         if not spec:
             return {"error": "選択した実験データが見つかりません。"}, 404
 
         input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
         point_total = len(input_values)
-        if point_total < 5:
-            return {"error": "機械学習には5行以上の測定データが必要です。"}, 400
+        if point_total < MIN_EXPERIMENT_POINTS:
+            return {"error": "機械学習には合計5行以上の測定データが必要です。"}, 400
 
         requested_points = req_data.get(
             "training_points",
@@ -796,11 +968,25 @@ def predict_dynamic():
         prediction_values = np.asarray(y_pred).reshape(-1)
         std_values = np.asarray(y_std).reshape(-1)
 
+        training_ranges = {
+            column: [
+                float(np.min(input_values[:, index])),
+                float(np.max(input_values[:, index]))
+            ]
+            for index, column in enumerate(input_columns)
+        }
+        out_of_range_conditions = {
+            column: value
+            for column, value in zip(input_columns, query_values)
+            if value < training_ranges[column][0] or value > training_ranges[column][1]
+        }
         return {
             "experiment_id": str(spec["_id"]),
             "training_points": requested_points,
             "total_points": point_total,
             "input_conditions": dict(zip(input_columns, query_values)),
+            "training_ranges": training_ranges,
+            "out_of_range_conditions": out_of_range_conditions,
             "predictions": dict(zip(target_columns, prediction_values.tolist())),
             "confidence_high": dict(zip(
                 target_columns,
@@ -824,12 +1010,14 @@ def predict_grid():
         if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
             return {"error": "学習対象の実験を選択してください。"}, 400
 
-        spec = db.spectrums.find_one({"_id": ObjectId(experiment_id)})
+        spec = find_experiment(ObjectId(experiment_id))
         if not spec:
             return {"error": "選択した実験データが見つかりません。"}, 404
 
         input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
         point_total = len(input_values)
+        if point_total < MIN_EXPERIMENT_POINTS:
+            return {"error": "機械学習には合計5行以上の測定データが必要です。"}, 400
         max_training_points = min(point_total, MAX_GPR_TRAINING_POINTS)
         requested_points = req_data.get(
             "training_points",
@@ -880,20 +1068,29 @@ def predict_grid():
             }, 400
 
         x_index = input_columns.index(x_column)
+        try:
+            x_range = resolve_axis_range(req_data.get("x_range"), input_values[:, x_index])
+        except ValueError as error:
+            return {"error": str(error)}, 400
         x_values = np.linspace(
-            float(np.min(input_values[:, x_index])),
-            float(np.max(input_values[:, x_index])),
+            x_range[0],
+            x_range[1],
             grid_size
         )
         if y_column is None:
             queries = np.tile(fixed_values, (grid_size, 1))
             queries[:, x_index] = x_values
             y_values = None
+            y_range = None
         else:
             y_index = input_columns.index(y_column)
+            try:
+                y_range = resolve_axis_range(req_data.get("y_range"), input_values[:, y_index])
+            except ValueError as error:
+                return {"error": str(error)}, 400
             y_values = np.linspace(
-                float(np.min(input_values[:, y_index])),
-                float(np.max(input_values[:, y_index])),
+                y_range[0],
+                y_range[1],
                 grid_size
             )
             x_mesh, y_mesh = np.meshgrid(x_values, y_values)
@@ -923,13 +1120,42 @@ def predict_grid():
                 grid_size, grid_size, len(target_columns)
             )
 
+        training_ranges = {
+            column: [
+                float(np.min(input_values[:, index])),
+                float(np.max(input_values[:, index]))
+            ]
+            for index, column in enumerate(input_columns)
+        }
+        out_of_range_conditions = {
+            column: float(fixed_values[index])
+            for index, column in enumerate(input_columns)
+            if column not in (x_column, y_column)
+            and (
+                fixed_values[index] < training_ranges[column][0]
+                or fixed_values[index] > training_ranges[column][1]
+            )
+        }
+        out_of_range_axes = {}
+        if x_range[0] < training_ranges[x_column][0] or x_range[1] > training_ranges[x_column][1]:
+            out_of_range_axes[x_column] = list(x_range)
+        if y_column and (
+            y_range[0] < training_ranges[y_column][0]
+            or y_range[1] > training_ranges[y_column][1]
+        ):
+            out_of_range_axes[y_column] = list(y_range)
         response = {
             "x_column": x_column,
             "y_column": y_column,
+            "x_range": list(x_range),
+            "y_range": list(y_range) if y_range is not None else None,
             "x_values": x_values.tolist(),
             "y_values": y_values.tolist() if y_values is not None else None,
             "training_points": requested_points,
             "total_points": point_total,
+            "training_ranges": training_ranges,
+            "out_of_range_conditions": out_of_range_conditions,
+            "out_of_range_axes": out_of_range_axes,
             "fixed_conditions": {
                 column: float(fixed_values[index])
                 for index, column in enumerate(input_columns)

@@ -23,6 +23,9 @@ class FakeCursor:
     def __iter__(self):
         return iter(self.documents)
 
+    def limit(self, count):
+        return FakeCursor(self.documents[:count])
+
 
 class FakeSpectrumCollection:
     def __init__(self, documents):
@@ -39,6 +42,43 @@ class FakeSpectrumCollection:
 
     def insert_one(self, document):
         self.documents.append(document)
+
+
+class FakeExperimentGroupCollection:
+    def __init__(self, documents=None):
+        self.documents = documents or []
+
+    def find(self, query=None):
+        query = query or {}
+        return FakeCursor([
+            document for document in self.documents
+            if all(document.get(key) == value for key, value in query.items())
+        ])
+
+    def find_one(self, query):
+        return next((
+            document for document in self.documents
+            if all(document.get(key) == value for key, value in query.items())
+        ), None)
+
+    def insert_one(self, document):
+        self.documents.append(document)
+
+    def update_one(self, query, update):
+        document = self.find_one(query)
+        if not document:
+            return SimpleNamespace(matched_count=0)
+        for key, value in update.get("$push", {}).items():
+            document.setdefault(key, []).append(value)
+        for key, value in update.get("$inc", {}).items():
+            document[key] = document.get(key, 0) + value
+        document.update(update.get("$set", {}))
+        return SimpleNamespace(matched_count=1)
+
+    def delete_one(self, query):
+        document = self.find_one(query)
+        if document:
+            self.documents.remove(document)
 
 
 class FakeGridFS:
@@ -136,7 +176,8 @@ class ExperimentCsvTests(unittest.TestCase):
 
     def test_creates_experiment_with_selected_numeric_columns(self):
         app_module.db = SimpleNamespace(
-            spectrums=FakeSpectrumCollection([])
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection()
         )
         response = app_module.app.test_client().post(
             "/api/experiments",
@@ -148,43 +189,127 @@ class ExperimentCsvTests(unittest.TestCase):
                 ), "measurements.csv"),
                 "input_columns": '["temperature", "field"]',
                 "target_columns": '["permeability", "loss"]',
-                "domain": "MI"
+                "domain": "MI",
+                "experiment_name": "sample experiment"
             },
             content_type="multipart/form-data"
         )
 
         self.assertEqual(response.status_code, 201)
-        experiment = app_module.db.spectrums.documents[0]
+        experiment = app_module.db.experiment_groups.documents[0]
         self.assertEqual(experiment["input_columns"], ["temperature", "field"])
         self.assertEqual(experiment["target_columns"], ["permeability", "loss"])
         self.assertEqual(experiment["row_count"], 5)
-        self.assertIn(experiment["csv_file_id"], app_module.fs.files)
+        self.assertEqual(experiment["run_count"], 1)
+        self.assertIn(experiment["runs"][0]["csv_file_id"], app_module.fs.files)
 
         listed = app_module.app.test_client().get("/api/experiments")
         self.assertEqual(listed.status_code, 200)
         listed_experiment = listed.json["experiments"][0]
+        self.assertEqual(listed_experiment["experiment_name"], "sample experiment")
         self.assertEqual(listed_experiment["input_columns"], ["temperature", "field"])
         self.assertEqual(listed_experiment["target_columns"], ["permeability", "loss"])
         self.assertEqual(listed_experiment["point_count"], 5)
+
+    def test_combines_separate_runs_and_predicts_an_unmeasured_input(self):
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection()
+        )
+        client = app_module.app.test_client()
+
+        def upload_run(current, filename):
+            csv_data = (
+                "current,time,voltage\n"
+                f"{current},0,0\n{current},1,1\n{current},2,2\n"
+            ).encode()
+            return client.post(
+                "/api/experiments",
+                data={
+                    "file": (io.BytesIO(csv_data), filename),
+                    "project_name": "circuits",
+                    "material_name": "RC",
+                    "domain": "EMC",
+                    "experiment_name": "RC response",
+                    "input_columns": '["current", "time"]',
+                    "target_columns": '["voltage"]'
+                },
+                content_type="multipart/form-data"
+            )
+
+        first = upload_run(1, "one-amp.csv")
+        second = upload_run(3, "three-amp.csv")
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(first.json["id"], second.json["id"])
+        self.assertEqual(second.json["row_count"], 6)
+        self.assertEqual(second.json["run_count"], 2)
+
+        group = app_module.db.experiment_groups.documents[0]
+        input_columns, target_columns, input_values, _ = app_module.load_experiment_table(group)
+        self.assertEqual(input_columns, ["current", "time"])
+        self.assertEqual(target_columns, ["voltage"])
+        self.assertEqual(input_values.shape, (6, 2))
+        self.assertEqual(set(input_values[:, 0]), {1, 3})
+
+        app_module.model_cache = {
+            "cache_key": None,
+            "gp_model": None,
+            "scaler": None
+        }
+
+        class FakeRegressor:
+            def __init__(self, **kwargs):
+                pass
+
+            def fit(self, x_values, y_values):
+                return self
+
+            def predict(self, x_values, return_std):
+                return np.zeros((len(x_values), 1)), np.ones((len(x_values), 1))
+
+        original_regressor = app_module.GaussianProcessRegressor
+        app_module.GaussianProcessRegressor = FakeRegressor
+        self.addCleanup(
+            setattr,
+            app_module,
+            "GaussianProcessRegressor",
+            original_regressor
+        )
+
+        response = client.post(
+            "/api/predict_dynamic",
+            json={
+                "experiment_id": first.json["id"],
+                "training_points": 5,
+                "conditions": {"current": 5, "time": 1}
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["input_conditions"]["current"], 5)
+        self.assertEqual(response.json["training_ranges"]["current"], [1, 3])
+        self.assertEqual(response.json["out_of_range_conditions"], {"current": 5})
 
     def test_imports_more_than_800_rows_but_caps_gpr_training_sample(self):
         csv_lines = ["x,y"]
         csv_lines.extend(f"{value},{value * 2}" for value in range(1200))
         app_module.db = SimpleNamespace(
-            spectrums=FakeSpectrumCollection([])
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection()
         )
         response = app_module.app.test_client().post(
             "/api/experiments",
             data={
                 "file": (io.BytesIO("\n".join(csv_lines).encode()), "large.csv"),
                 "input_columns": '["x"]',
-                "target_columns": '["y"]'
+                "target_columns": '["y"]',
+                "experiment_name": "large"
             },
             content_type="multipart/form-data"
         )
 
         self.assertEqual(response.status_code, 201)
-        spec = app_module.db.spectrums.documents[0]
+        spec = app_module.db.experiment_groups.documents[0]
         self.assertEqual(spec["row_count"], 1200)
 
         invalid_training_request = app_module.app.test_client().post(
@@ -413,15 +538,25 @@ class ExperimentCsvTests(unittest.TestCase):
                 "conditions": conditions,
                 "x_column": "wavelength",
                 "y_column": "time",
+                "x_range": [350, 650],
+                "y_range": [-1, 5],
                 "grid_size": 5
             }
         )
         self.assertEqual(surface.status_code, 200)
+        self.assertEqual(surface.json["x_range"], [350, 650])
+        self.assertEqual(surface.json["y_range"], [-1, 5])
+        self.assertEqual(
+            surface.json["out_of_range_axes"],
+            {"wavelength": [350, 650], "time": [-1, 5]}
+        )
         self.assertEqual(len(surface.json["x_values"]), 5)
         self.assertEqual(len(surface.json["y_values"]), 5)
         self.assertEqual(len(surface.json["predictions"]["intensity"]), 5)
         self.assertEqual(len(surface.json["predictions"]["intensity"][0]), 5)
         self.assertEqual(len(surface.json["predictions"]["absorbance"][0]), 5)
+        self.assertEqual(len(surface.json["confidence_low"]["intensity"]), 5)
+        self.assertEqual(len(surface.json["confidence_low"]["intensity"][0]), 5)
 
         line = client.post(
             "/api/predict_grid",

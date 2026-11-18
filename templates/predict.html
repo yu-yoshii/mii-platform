@@ -123,6 +123,12 @@
             color: #64748b;
             font-size: 0.88em;
         }
+        .range-pair {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 6px;
+        }
     </style>
 </head>
 <body>
@@ -155,7 +161,9 @@
         <div id="predictionResults" aria-live="polite"></div>
         <section class="graph-panel">
             <h3>予測グラフ</h3>
-            <p class="graph-help" id="graphHelp">条件を入力して予測すると、グラフを表示できます。</p>
+            <p class="graph-help" id="graphHelp">
+                条件を入力して予測するとグラフを表示できます。学習範囲の外を指定すると、その条件の予測は外挿になります。
+            </p>
             <div class="graph-controls">
                 <div class="input-box">
                     <label for="graphDimension">グラフで見る条件の数</label>
@@ -168,9 +176,25 @@
                     <label for="xAxisSelect">横軸</label>
                     <select id="xAxisSelect"></select>
                 </div>
+                <div class="input-box">
+                    <label>横軸の表示範囲</label>
+                    <div class="range-pair">
+                        <input type="number" id="xRangeMin" step="any" aria-label="横軸の最小値">
+                        <span>～</span>
+                        <input type="number" id="xRangeMax" step="any" aria-label="横軸の最大値">
+                    </div>
+                </div>
                 <div class="input-box" id="yAxisGroup">
                     <label for="yAxisSelect">もう一つの条件（縦/奥行き）</label>
                     <select id="yAxisSelect"></select>
+                </div>
+                <div class="input-box" id="yRangeGroup">
+                    <label>もう一つの条件の範囲</label>
+                    <div class="range-pair">
+                        <input type="number" id="yRangeMin" step="any" aria-label="2つ目の条件の最小値">
+                        <span>～</span>
+                        <input type="number" id="yRangeMax" step="any" aria-label="2つ目の条件の最大値">
+                    </div>
                 </div>
                 <div class="input-box">
                     <label for="targetSelect">表示する結果</label>
@@ -188,6 +212,7 @@
 
     <script>
         let predictionAvailable = false;
+        let trainingRanges = {};
 
         async function loadExperiments() {
             const select = document.getElementById('experimentSelect');
@@ -209,9 +234,13 @@
                 }
 
                 result.experiments.forEach(experiment => {
-                    const label = `${experiment.project_name} / ${experiment.material_name} — ${experiment.domain} (${experiment.point_count}行)`;
+                    const label =
+                        `${experiment.experiment_name} / ${experiment.project_name} / ` +
+                        `${experiment.material_name} — ${experiment.domain} ` +
+                        `(${experiment.point_count}行・${experiment.run_count}件)`;
                     const option = new Option(label, experiment.id);
                     option.dataset.pointCount = experiment.point_count;
+                    option.dataset.runCount = experiment.run_count;
                     option.dataset.inputColumns = JSON.stringify(experiment.input_columns);
                     option.dataset.targetColumns = JSON.stringify(experiment.target_columns);
                     select.add(option);
@@ -237,7 +266,11 @@
             const conditionFields = document.getElementById('conditionFields');
             conditionFields.replaceChildren();
             document.getElementById('predictionResults').replaceChildren();
+            ['xRangeMin', 'xRangeMax', 'yRangeMin', 'yRangeMax'].forEach(id => {
+                document.getElementById(id).value = '';
+            });
             predictionAvailable = false;
+            trainingRanges = {};
             clearPredictionGraph();
 
             inputColumns.forEach(column => {
@@ -268,7 +301,7 @@
                 ? Math.min({{ default_training_points }}, trainingLimit)
                 : 5;
             help.textContent = totalPoints < 5
-                ? `この実験は${totalPoints}点のため、予測には最低5点必要です。`
+                ? `現在${totalPoints}行です。同じ実験セット名でCSVを追加し、合計5行以上にしてください。`
                 : totalPoints > {{ max_training_points }}
                     ? `全${totalPoints}行を登録済み。計算時は最大{{ max_training_points }}点を均等に抽出します。`
                     : `全${totalPoints}行から指定した点数を均等に抽出します。`;
@@ -303,6 +336,8 @@
             const previousY = yAxis.value;
             const previousTarget = target.value;
             const previousStyle = style.value;
+            const previousXColumn = previousX;
+            const previousYColumn = previousY;
 
             if (resetDimension) {
                 dimension.value = inputColumns.length > 1 ? '2' : '1';
@@ -315,13 +350,28 @@
             const availableY = inputColumns.filter(column => column !== xAxis.value);
             yAxis.replaceChildren(...availableY.map(column => new Option(column, column)));
             yAxis.value = availableY.includes(previousY) ? previousY : availableY[0] || '';
+            if (xAxis.value !== previousXColumn || !document.getElementById('xRangeMin').value) {
+                const range = trainingRanges[xAxis.value];
+                document.getElementById('xRangeMin').value = range?.[0] ?? '';
+                document.getElementById('xRangeMax').value = range?.[1] ?? '';
+            }
+            if (yAxis.value !== previousYColumn || !document.getElementById('yRangeMin').value) {
+                const range = trainingRanges[yAxis.value];
+                document.getElementById('yRangeMin').value = range?.[0] ?? '';
+                document.getElementById('yRangeMax').value = range?.[1] ?? '';
+            }
             target.replaceChildren(...targetColumns.map(column => new Option(column, column)));
             target.value = targetColumns.includes(previousTarget) ? previousTarget : targetColumns[0] || '';
 
             const isSurface = dimension.value === '2' && inputColumns.length > 1;
             document.getElementById('yAxisGroup').style.display = isSurface ? '' : 'none';
+            document.getElementById('yRangeGroup').style.display = isSurface ? '' : 'none';
             const graphStyles = isSurface
-                ? [['立体曲面', 'surface'], ['色分け図', 'heatmap']]
+                ? [
+                    ['立体曲面（色で95%予測区間幅を表示）', 'surface'],
+                    ['予測値の色分け図', 'heatmap'],
+                    ['95%予測区間幅の色分け図', 'uncertainty']
+                ]
                 : [['折れ線', 'line'], ['棒グラフ', 'bar']];
             style.replaceChildren(...graphStyles.map(([label, value]) => new Option(label, value)));
             style.value = graphStyles.some(([, value]) => value === previousStyle)
@@ -388,10 +438,22 @@
 
         function renderPredictionResults(data) {
             const container = document.getElementById('predictionResults');
+            trainingRanges = data.training_ranges || {};
+            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            updateGraphControls(
+                JSON.parse(selected?.dataset.inputColumns || '[]'),
+                JSON.parse(selected?.dataset.targetColumns || '[]')
+            );
             const summary = document.createElement('p');
             summary.style.color = '#64748b';
             summary.textContent =
                 `入力した条件: ${Object.entries(data.input_conditions).map(([name, value]) => `${name} = ${value}`).join('、')} / 学習に使用: ${data.training_points}行`;
+            const outOfRange = Object.entries(data.out_of_range_conditions || {});
+            const warning = document.createElement('p');
+            warning.style.cssText = 'color:#b45309; background:#fff7ed; padding:10px; border-radius:8px;';
+            warning.textContent = outOfRange.length
+                ? `注意: ${outOfRange.map(([name, value]) => `${name}=${value}`).join('、')}は学習した範囲外です。外挿のため予測の不確かさが高く、結果を保証するものではありません。`
+                : '表の範囲は、登録データの条件内で予測した結果です。';
             const table = document.createElement('table');
             const header = table.createTHead().insertRow();
             ['結果', '予測値', '95%予測区間（下限）', '95%予測区間（上限）'].forEach(text => {
@@ -413,7 +475,7 @@
                     cell.textContent = text;
                 });
             });
-            container.replaceChildren(summary, table);
+            container.replaceChildren(summary, warning, table);
         }
 
         async function drawPredictionGraph() {
@@ -438,6 +500,10 @@
                         y_column: dimension === '2'
                             ? document.getElementById('yAxisSelect').value
                             : null,
+                        x_range: getAxisRange('xRangeMin', 'xRangeMax'),
+                        y_range: dimension === '2'
+                            ? getAxisRange('yRangeMin', 'yRangeMax')
+                            : null,
                         grid_size: 40
                     })
                 });
@@ -447,41 +513,114 @@
                 const target = document.getElementById('targetSelect').value;
                 const style = document.getElementById('graphStyle').value;
                 const isSurface = data.y_values !== null;
-                const trace = isSurface
-                    ? style === 'surface'
-                        ? {
+                const meanValues = data.predictions[target];
+                const lowValues = data.confidence_low[target];
+                const highValues = data.confidence_high[target];
+                const intervalWidths = highValues.map(
+                    (value, index) => value - lowValues[index]
+                );
+                const intervalCustomData = isSurface
+                    ? meanValues.map((row, rowIndex) => row.map((_, columnIndex) => [
+                        lowValues[rowIndex][columnIndex],
+                        highValues[rowIndex][columnIndex]
+                    ]))
+                    : null;
+                let traces;
+                if (isSurface && style === 'surface') {
+                    traces = [{
                             type: 'surface',
                             x: data.x_values,
                             y: data.y_values,
-                            z: data.predictions[target],
+                            z: meanValues,
+                            surfacecolor: intervalWidths,
                             colorscale: 'Viridis',
-                            colorbar: { title: target }
-                        }
-                        : {
+                            colorbar: { title: '95%予測区間幅' },
+                            customdata: intervalCustomData,
+                            hovertemplate:
+                                `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                `<br>${target}: %{z}<br>95%区間: ` +
+                                `%{customdata[0]}～%{customdata[1]}<extra></extra>`
+                    }];
+                } else if (isSurface) {
+                    const uncertaintyOnly = style === 'uncertainty';
+                    traces = [{
                             type: 'heatmap',
                             x: data.x_values,
                             y: data.y_values,
-                            z: data.predictions[target],
+                            z: uncertaintyOnly ? intervalWidths : meanValues,
                             colorscale: 'Viridis',
-                            colorbar: { title: target }
-                        }
-                    : {
-                        type: style === 'bar' ? 'bar' : 'scatter',
-                        mode: style === 'bar' ? undefined : 'lines',
+                            colorbar: { title: uncertaintyOnly ? '95%予測区間幅' : target },
+                            customdata: intervalCustomData,
+                            hovertemplate: uncertaintyOnly
+                                ? `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                    `<br>95%予測区間幅: %{z}<br>上下限: ` +
+                                    `%{customdata[0]}～%{customdata[1]}<extra></extra>`
+                                : `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                    `<br>${target}: %{z}<br>95%区間: ` +
+                                    `%{customdata[0]}～%{customdata[1]}<extra></extra>`
+                    }];
+                } else if (style === 'bar') {
+                    traces = [{
+                        type: 'bar',
                         x: data.x_values,
-                        y: data.predictions[target],
+                        y: meanValues,
                         name: target,
+                        customdata: lowValues.map((value, index) => [
+                            value,
+                            highValues[index]
+                        ]),
+                        hovertemplate:
+                            `${data.x_column}: %{x}<br>${target}: %{y}` +
+                            `<br>95%予測区間: %{customdata[0]}～` +
+                            `%{customdata[1]}<extra></extra>`,
                         error_y: {
                             type: 'data',
-                            array: data.confidence_high[target].map(
-                                (value, index) => value - data.predictions[target][index]
-                            ),
-                            arrayminus: data.confidence_low[target].map(
-                                (value, index) => data.predictions[target][index] - value
-                            ),
+                            symmetric: false,
+                            array: highValues.map((value, index) => value - meanValues[index]),
+                            arrayminus: meanValues.map((value, index) => value - lowValues[index]),
                             visible: true
                         }
-                    };
+                    }];
+                } else {
+                    traces = [
+                        {
+                            type: 'scatter',
+                            mode: 'lines',
+                            x: data.x_values,
+                            y: lowValues,
+                            line: { width: 0 },
+                            showlegend: false,
+                            hoverinfo: 'skip'
+                        },
+                        {
+                            type: 'scatter',
+                            mode: 'lines',
+                            x: data.x_values,
+                            y: highValues,
+                            line: { width: 0 },
+                            fill: 'tonexty',
+                            fillcolor: 'rgba(59,130,246,0.2)',
+                            name: '95%予測区間',
+                            hoverinfo: 'skip'
+                        },
+                        {
+                            type: 'scatter',
+                            mode: 'lines',
+                            x: data.x_values,
+                            y: meanValues,
+                            line: { color: '#2563eb', width: 3 },
+                            name: target,
+                            customdata: lowValues.map((value, index) => [
+                                value,
+                                highValues[index]
+                            ]),
+                            hovertemplate:
+                                `${data.x_column}: %{x}<br>${target}: %{y}` +
+                                `<br>95%予測区間: %{customdata[0]}～` +
+                                `%{customdata[1]}<extra></extra>`
+                        }
+                    ];
+                }
                 const axisDescription = isSurface
                     ? `${data.x_column} × ${data.y_column}`
                     : data.x_column;
@@ -489,7 +628,7 @@
                     .map(([name, value]) => `${name}=${value}`)
                     .join('、');
                 const layout = {
-                    title: `${target} の予測（${axisDescription}）`,
+                    title: `${target} の予測と95%予測区間（${axisDescription}）`,
                     autosize: true,
                     margin: { l: 60, r: 30, t: 60, b: 60 },
                     xaxis: { title: data.x_column },
@@ -504,19 +643,36 @@
                 }
                 await Plotly.newPlot(
                     document.getElementById('predictionGraph'),
-                    [trace],
+                    traces,
                     layout,
                     { responsive: true, displaylogo: false }
                 );
+                const outOfRange = [
+                    ...Object.keys(data.out_of_range_conditions || {}),
+                    ...Object.keys(data.out_of_range_axes || {})
+                ];
                 document.getElementById('graphHelp').textContent =
                     `全${data.total_points}行から${data.training_points}点で予測` +
-                    (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '');
+                    (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '') +
+                    (outOfRange.length
+                        ? ` / 注意: ${[...new Set(outOfRange)].join('、')}は学習範囲外です。95%予測区間を参考にしてください。`
+                        : '');
             } catch (error) {
                 document.getElementById('graphHelp').textContent = error.message;
             } finally {
                 drawButton.disabled = !predictionAvailable;
                 drawButton.textContent = 'グラフを更新';
             }
+        }
+
+        function getAxisRange(minId, maxId) {
+            const minValue = document.getElementById(minId).value;
+            const maxValue = document.getElementById(maxId).value;
+            if (!minValue && !maxValue) return null;
+            if (!minValue || !maxValue) {
+                throw new Error('グラフの範囲は最小値と最大値を両方入力してください。');
+            }
+            return [Number(minValue), Number(maxValue)];
         }
 
         document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
@@ -536,18 +692,37 @@
             );
         });
         document.getElementById('xAxisSelect').addEventListener('change', () => {
+            document.getElementById('xRangeMin').value = '';
+            document.getElementById('xRangeMax').value = '';
             const selected = document.getElementById('experimentSelect').selectedOptions[0];
             updateGraphControls(
                 JSON.parse(selected?.dataset.inputColumns || '[]'),
                 JSON.parse(selected?.dataset.targetColumns || '[]')
             );
         });
-        ['yAxisSelect', 'targetSelect', 'graphStyle'].forEach(id => {
+        document.getElementById('yAxisSelect').addEventListener('change', () => {
+            document.getElementById('yRangeMin').value = '';
+            document.getElementById('yRangeMax').value = '';
+            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            updateGraphControls(
+                JSON.parse(selected?.dataset.inputColumns || '[]'),
+                JSON.parse(selected?.dataset.targetColumns || '[]')
+            );
+        });
+        ['targetSelect', 'graphStyle'].forEach(id => {
             document.getElementById(id).addEventListener('change', () => {
                 if (!predictionAvailable) return;
                 clearPredictionGraph();
                 document.getElementById('graphHelp').textContent =
                     '表示設定を変更しました。「グラフを更新」を押してください。';
+            });
+        });
+        ['xRangeMin', 'xRangeMax', 'yRangeMin', 'yRangeMax'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => {
+                if (!predictionAvailable) return;
+                clearPredictionGraph();
+                document.getElementById('graphHelp').textContent =
+                    '表示範囲を変更しました。「グラフを更新」を押してください。';
             });
         });
         loadExperiments();
