@@ -488,6 +488,9 @@ class ExperimentCsvTests(unittest.TestCase):
                 pass
 
             def fit(self, x_values, y_values):
+                self.kernel_ = SimpleNamespace(
+                    k2=SimpleNamespace(noise_level=0.1)
+                )
                 return self
 
             def predict(self, x_values, return_std):
@@ -530,9 +533,20 @@ class ExperimentCsvTests(unittest.TestCase):
             model,
             np.array([[2.5], [15.0]])
         )
+        latent_standard_deviation = (
+            app_module.latent_function_standard_deviation(
+                model, standard_deviation
+            )
+        )
 
         self.assertIsNotNone(standard_deviation)
         self.assertGreater(standard_deviation[1, 0], standard_deviation[0, 0])
+        self.assertTrue(np.all(latent_standard_deviation <= standard_deviation))
+        self.assertTrue(np.all(latent_standard_deviation >= 0))
+        self.assertGreater(
+            latent_standard_deviation[1, 0],
+            latent_standard_deviation[0, 0]
+        )
 
     def test_model_comparison_uses_whole_run_validation(self):
         times = np.tile(np.arange(21, dtype=float) * 0.25, 2)
@@ -747,6 +761,9 @@ class ExperimentCsvTests(unittest.TestCase):
 
             def fit(self, x_values, y_values):
                 FakeRegressor.fitted_x = x_values[:, 0].tolist()
+                self.kernel_ = SimpleNamespace(
+                    k2=SimpleNamespace(noise_level=0.1)
+                )
                 return self
 
             def predict(self, x_values, return_std):
@@ -805,6 +822,9 @@ class ExperimentCsvTests(unittest.TestCase):
 
             def fit(self, x_values, y_values):
                 self.target_count = y_values.shape[1]
+                self.kernel_ = SimpleNamespace(
+                    k2=SimpleNamespace(noise_level=0.1)
+                )
                 return self
 
             def predict(self, x_values, return_std):
@@ -840,6 +860,19 @@ class ExperimentCsvTests(unittest.TestCase):
             "permeability": 8.04,
             "loss": 16.08
         })
+        self.assertEqual(
+            response.json["confidence_interval"]["method"],
+            "latent_function_posterior"
+        )
+        for column in ("permeability", "loss"):
+            self.assertLessEqual(
+                response.json["latent_confidence_low"][column],
+                response.json["predictions"][column]
+            )
+            self.assertGreaterEqual(
+                response.json["latent_confidence_high"][column],
+                response.json["predictions"][column]
+            )
         self.assertEqual(
             response.json["input_columns"],
             ["temperature", "field"]
@@ -878,6 +911,9 @@ class ExperimentCsvTests(unittest.TestCase):
                 pass
 
             def fit(self, x_values, y_values):
+                self.kernel_ = SimpleNamespace(
+                    k2=SimpleNamespace(noise_level=0.1)
+                )
                 return self
 
             def predict(self, x_values, return_std):
@@ -927,6 +963,14 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(len(surface.json["predictions"]["absorbance"][0]), 5)
         self.assertEqual(len(surface.json["confidence_low"]["intensity"]), 5)
         self.assertEqual(len(surface.json["confidence_low"]["intensity"][0]), 5)
+        self.assertEqual(
+            surface.json["confidence_interval"]["method"],
+            "latent_function_posterior"
+        )
+        self.assertEqual(
+            len(surface.json["latent_confidence_low"]["intensity"][0]),
+            5
+        )
 
         line = client.post(
             "/api/predict_grid",
