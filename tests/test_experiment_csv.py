@@ -103,6 +103,7 @@ class ExperimentCsvTests(unittest.TestCase):
         self.original_db = app_module.db
         self.original_fs = app_module.fs
         self.original_model_cache = app_module.model_cache.copy()
+        self.original_model_validation_cache = app_module.model_validation_cache.copy()
         self.original_experiment_table_cache = app_module.experiment_table_cache.copy()
         self.temp_directory = tempfile.TemporaryDirectory()
         app_module.app.instance_path = self.temp_directory.name
@@ -114,6 +115,7 @@ class ExperimentCsvTests(unittest.TestCase):
         app_module.db = self.original_db
         app_module.fs = self.original_fs
         app_module.model_cache = self.original_model_cache
+        app_module.model_validation_cache = self.original_model_validation_cache
         app_module.experiment_table_cache = self.original_experiment_table_cache
         self.temp_directory.cleanup()
 
@@ -139,6 +141,12 @@ class ExperimentCsvTests(unittest.TestCase):
 
         self.assertEqual(x_values.tolist(), [0, 2, 4, 6, 8])
         self.assertEqual(y_values.tolist(), [0, 20, 40, 60, 80])
+
+    def test_constant_graph_axis_gets_a_usable_default_range(self):
+        self.assertEqual(
+            app_module.resolve_axis_range(None, np.ones(5)),
+            (0.5, 1.5)
+        )
 
     def test_creates_file_for_legacy_database_experiment(self):
         spec = {
@@ -289,6 +297,154 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(response.json["input_conditions"]["current"], 5)
         self.assertEqual(response.json["training_ranges"]["current"], [1, 3])
         self.assertEqual(response.json["out_of_range_conditions"], {"current": 5})
+
+    def test_rc_model_fits_shared_parameters_and_predicts_five_amps(self):
+        times = np.tile(np.arange(21, dtype=float) * 0.25, 2)
+        currents = np.repeat([1.0, 3.0], 21)
+        input_values = np.column_stack((currents, times))
+        target_values = (
+            currents * 1.5 * (1 - np.exp(-times / 2))
+        ).reshape(-1, 1)
+        input_columns = ["current_A", "time_s"]
+        target_columns = ["voltage_V"]
+
+        model = app_module.fit_rc_parallel_model(
+            input_values, target_values, input_columns, target_columns
+        )
+        predicted, predicted_std = app_module.predict_experiment_candidate(
+            model,
+            np.array([[5.0, 5.0], [5.0, 15.0]])
+        )
+
+        self.assertAlmostEqual(model["resistance"], 1.5, places=5)
+        self.assertAlmostEqual(model["time_constant"], 2.0, places=5)
+        np.testing.assert_allclose(
+            predicted[:, 0],
+            [6.8844, 7.4959],
+            atol=0.0001
+        )
+        self.assertTrue(np.all(np.isfinite(predicted_std)))
+
+    def test_auto_selection_uses_whole_run_validation(self):
+        times = np.tile(np.arange(21, dtype=float) * 0.25, 2)
+        currents = np.repeat([1.0, 3.0], 21)
+        input_values = np.column_stack((currents, times))
+        target_values = (
+            currents * 1.5 * (1 - np.exp(-times / 2))
+        ).reshape(-1, 1)
+        spec = {
+            "_id": "run-validation",
+            "runs": [
+                {"csv_file_id": "one-amp", "row_count": 21},
+                {"csv_file_id": "three-amp", "row_count": 21}
+            ]
+        }
+        app_module.model_validation_cache = {"cache_key": None, "result": None}
+
+        validation = app_module.validate_experiment_models(
+            spec,
+            ["current_A", "time_s"],
+            ["voltage_V"],
+            input_values,
+            target_values,
+            42
+        )
+
+        self.assertTrue(validation["available"])
+        self.assertEqual(validation["fold_count"], 2)
+        self.assertEqual(validation["best_model"], "rc_parallel")
+        self.assertEqual(
+            {candidate["model_type"] for candidate in validation["candidates"]},
+            {"gpr", "polynomial", "rc_parallel"}
+        )
+        rc_result = next(
+            candidate for candidate in validation["candidates"]
+            if candidate["model_type"] == "rc_parallel"
+        )
+        self.assertLess(rc_result["rmse_by_target"]["voltage_V"], 1e-10)
+        app_module.model_cache = {
+            "cache_key": None,
+            "gp_model": None,
+            "scaler": None
+        }
+        selected_model, reason, model, _ = app_module.prepare_experiment_model(
+            spec,
+            ["current_A", "time_s"],
+            ["voltage_V"],
+            input_values,
+            target_values,
+            42,
+            "auto"
+        )
+        prediction, _ = app_module.predict_experiment_candidate(
+            model, np.array([[5.0, 15.0]])
+        )
+        self.assertEqual(selected_model, "rc_parallel")
+        self.assertEqual(reason, "run_holdout")
+        self.assertAlmostEqual(prediction[0, 0], 7.4959, places=4)
+
+    def test_prediction_grid_uses_rc_model_and_reports_both_extrapolations(self):
+        run_files = [ObjectId(), ObjectId()]
+        runs = []
+        for current, file_id in zip([1.0, 3.0], run_files):
+            rows = ["current_A,time_s,voltage_V"]
+            for index in range(21):
+                time = index * 0.25
+                voltage = current * 1.5 * (1 - np.exp(-time / 2))
+                rows.append(f"{current:g},{time:.2f},{voltage:.4f}")
+            app_module.fs.files[file_id] = "\n".join(rows).encode()
+            runs.append({
+                "csv_file_id": file_id,
+                "row_count": 21
+            })
+
+        spec = {
+            "_id": ObjectId(),
+            "input_columns": ["current_A", "time_s"],
+            "target_columns": ["voltage_V"],
+            "row_count": 42,
+            "runs": runs
+        }
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection([spec])
+        )
+        app_module.model_cache = {
+            "cache_key": None,
+            "gp_model": None,
+            "scaler": None
+        }
+        app_module.model_validation_cache = {"cache_key": None, "result": None}
+
+        response = app_module.app.test_client().post(
+            "/api/predict_grid",
+            json={
+                "experiment_id": str(spec["_id"]),
+                "training_points": 42,
+                "conditions": {"current_A": 5, "time_s": 0},
+                "x_column": "time_s",
+                "y_column": None,
+                "x_range": [0, 15],
+                "grid_size": 5,
+                "model_type": "auto"
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["model_type"], "rc_parallel")
+        self.assertAlmostEqual(
+            response.json["model_parameters"]["resistance_ohm"],
+            1.5,
+            places=5
+        )
+        self.assertEqual(response.json["validation_runs"], 2)
+        self.assertEqual(response.json["out_of_range_conditions"], {"current_A": 5})
+        self.assertEqual(response.json["out_of_range_axes"], {"time_s": [0, 15]})
+        self.assertAlmostEqual(
+            response.json["predictions"]["voltage_V"][-1],
+            7.4959,
+            places=4
+        )
 
     def test_imports_more_than_800_rows_but_caps_gpr_training_sample(self):
         csv_lines = ["x,y"]

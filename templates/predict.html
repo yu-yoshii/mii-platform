@@ -129,6 +129,21 @@
             align-items: center;
             gap: 6px;
         }
+        .condition-explanation {
+            grid-column: 1 / -1;
+            margin: 0;
+            color: #475569;
+            font-size: 0.9em;
+        }
+        .prediction-warning {
+            display: none;
+            margin: 12px 0;
+            padding: 12px 14px;
+            border: 1px solid #fdba74;
+            border-radius: 8px;
+            background: #fff7ed;
+            color: #9a3412;
+        }
     </style>
 </head>
 <body>
@@ -153,6 +168,22 @@
                 <input type="number" id="trainingPoints" value="250" min="5" step="1">
                 <small class="input-help" id="trainingPointsHelp">全データから均等に抽出します。</small>
             </div>
+            <div class="input-box">
+                <label for="modelSelect">予測モデル</label>
+                <select id="modelSelect">
+                    <option value="auto">自動選択（CSV単位で検証）</option>
+                    <option value="gpr">汎用ガウス過程（補間向け）</option>
+                    <option value="polynomial">2次多項式回帰</option>
+                    <option value="rc_parallel">並列RC回路モデル</option>
+                </select>
+                <small class="input-help">
+                    自動選択はCSVを丸ごと外してモデルを比較します。RC回路モデルは理想的な定電流源＋R-C並列回路を仮定します。
+                </small>
+            </div>
+            <p class="condition-explanation">
+                <strong>予測条件（固定値）</strong> — 下の電流などを入力します。
+                グラフの軸に選んだ条件は固定されず、軸の値に沿って変化します。
+            </p>
             <div id="conditionFields"></div>
         </div>
 
@@ -166,18 +197,18 @@
             </p>
             <div class="graph-controls">
                 <div class="input-box">
-                    <label for="graphDimension">グラフで見る条件の数</label>
+                    <label for="graphDimension">グラフ上で変化させる条件の数</label>
                     <select id="graphDimension">
                         <option value="1">1つの条件を変える</option>
                         <option value="2">2つの条件を変える</option>
                     </select>
                 </div>
                 <div class="input-box">
-                    <label for="xAxisSelect">横軸</label>
+                    <label for="xAxisSelect">変化させる条件（横軸）</label>
                     <select id="xAxisSelect"></select>
                 </div>
                 <div class="input-box">
-                    <label>横軸の表示範囲</label>
+                    <label>横軸の予測範囲（表示だけでなく予測対象）</label>
                     <div class="range-pair">
                         <input type="number" id="xRangeMin" step="any" aria-label="横軸の最小値">
                         <span>～</span>
@@ -189,7 +220,7 @@
                     <select id="yAxisSelect"></select>
                 </div>
                 <div class="input-box" id="yRangeGroup">
-                    <label>もう一つの条件の範囲</label>
+                    <label>2つ目の条件の予測範囲</label>
                     <div class="range-pair">
                         <input type="number" id="yRangeMin" step="any" aria-label="2つ目の条件の最小値">
                         <span>～</span>
@@ -206,6 +237,7 @@
                 </div>
             </div>
             <button type="button" class="btn-predict" id="drawGraphBtn" onclick="drawPredictionGraph()" disabled>グラフを更新</button>
+            <div class="prediction-warning" id="graphWarning" role="alert"></div>
             <div id="predictionGraph" role="img" aria-label="実験結果の予測グラフ"></div>
         </section>
     </div>
@@ -213,6 +245,45 @@
     <script>
         let predictionAvailable = false;
         let trainingRanges = {};
+        let activeModelType = null;
+
+        function supportsRcParallelModel(inputColumns, targetColumns) {
+            const contains = (column, expressions) =>
+                expressions.some(expression => expression.test(column));
+            return inputColumns.filter(column =>
+                contains(column, [/current/i, /ampere/i, /^amps?/i, /電流/]) ||
+                ['ia', 'iamp'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
+            ).length === 1 &&
+                inputColumns.filter(column =>
+                    contains(column, [/time/i, /elapsed/i, /時間/]) ||
+                    ['t', 'ts', 'tsec'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
+                ).length === 1 &&
+                targetColumns.filter(column =>
+                    contains(column, [/voltage/i, /volt/i, /電圧/]) ||
+                    ['v', 'vc', 'vout'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
+                ).length === 1 &&
+                targetColumns.length === 1;
+        }
+
+        function updateConditionRangeHint(input) {
+            const hint = input.parentElement.querySelector('.condition-range-help');
+            const range = trainingRanges[input.dataset.column];
+            if (!range) {
+                hint.textContent = '';
+                return;
+            }
+            const isOutside = Number(input.value) < range[0] || Number(input.value) > range[1];
+            hint.textContent = `学習範囲: ${range[0]}～${range[1]}` +
+                (input.value && isOutside ? '（範囲外の外挿）' : '');
+            hint.style.color = input.value && isOutside ? '#b45309' : '#64748b';
+        }
+
+        function defaultAxisDisplayRange(range) {
+            if (!range) return null;
+            if (range[0] !== range[1]) return range;
+            const padding = Math.max(Math.abs(range[0]) * 0.1, 0.5);
+            return [range[0] - padding, range[1] + padding];
+        }
 
         async function loadExperiments() {
             const select = document.getElementById('experimentSelect');
@@ -263,6 +334,7 @@
             const totalPoints = Number(selected?.dataset.pointCount || 0);
             const inputColumns = JSON.parse(selected?.dataset.inputColumns || '[]');
             const targetColumns = JSON.parse(selected?.dataset.targetColumns || '[]');
+            const modelSelect = document.getElementById('modelSelect');
             const conditionFields = document.getElementById('conditionFields');
             conditionFields.replaceChildren();
             document.getElementById('predictionResults').replaceChildren();
@@ -270,8 +342,15 @@
                 document.getElementById(id).value = '';
             });
             predictionAvailable = false;
+            activeModelType = null;
             trainingRanges = {};
             clearPredictionGraph();
+            modelSelect.querySelector('option[value="rc_parallel"]').disabled =
+                !supportsRcParallelModel(inputColumns, targetColumns);
+            if (modelSelect.value === 'rc_parallel' &&
+                !supportsRcParallelModel(inputColumns, targetColumns)) {
+                modelSelect.value = 'auto';
+            }
 
             inputColumns.forEach(column => {
                 const wrapper = document.createElement('div');
@@ -283,7 +362,10 @@
                 input.step = 'any';
                 input.required = true;
                 input.dataset.column = column;
+                const rangeHint = document.createElement('small');
+                rangeHint.className = 'input-help condition-range-help';
                 input.addEventListener('input', () => {
+                    updateConditionRangeHint(input);
                     document.getElementById('predictionResults').replaceChildren();
                     predictionAvailable = false;
                     clearPredictionGraph();
@@ -291,7 +373,7 @@
                         '条件を変更しました。再度予測してください。';
                     updatePredictButton();
                 });
-                wrapper.append(label, input);
+                wrapper.append(label, input, rangeHint);
                 conditionFields.append(wrapper);
             });
 
@@ -340,23 +422,28 @@
             const previousYColumn = previousY;
 
             if (resetDimension) {
-                dimension.value = inputColumns.length > 1 ? '2' : '1';
+                dimension.value = '1';
             } else if (inputColumns.length < 2) {
                 dimension.value = '1';
             }
             dimension.options[1].disabled = inputColumns.length < 2;
             xAxis.replaceChildren(...inputColumns.map(column => new Option(column, column)));
-            xAxis.value = inputColumns.includes(previousX) ? previousX : inputColumns[0] || '';
+            const preferredX = inputColumns.find(column =>
+                /(time|elapsed|時間)/i.test(column)
+            ) || inputColumns[0] || '';
+            xAxis.value = !resetDimension && inputColumns.includes(previousX)
+                ? previousX
+                : preferredX;
             const availableY = inputColumns.filter(column => column !== xAxis.value);
             yAxis.replaceChildren(...availableY.map(column => new Option(column, column)));
             yAxis.value = availableY.includes(previousY) ? previousY : availableY[0] || '';
             if (xAxis.value !== previousXColumn || !document.getElementById('xRangeMin').value) {
-                const range = trainingRanges[xAxis.value];
+                const range = defaultAxisDisplayRange(trainingRanges[xAxis.value]);
                 document.getElementById('xRangeMin').value = range?.[0] ?? '';
                 document.getElementById('xRangeMax').value = range?.[1] ?? '';
             }
             if (yAxis.value !== previousYColumn || !document.getElementById('yRangeMin').value) {
-                const range = trainingRanges[yAxis.value];
+                const range = defaultAxisDisplayRange(trainingRanges[yAxis.value]);
                 document.getElementById('yRangeMin').value = range?.[0] ?? '';
                 document.getElementById('yRangeMax').value = range?.[1] ?? '';
             }
@@ -378,8 +465,8 @@
                 ? previousStyle
                 : graphStyles[0][1];
             document.getElementById('graphHelp').textContent = isSurface
-                ? '選んだ2条件を全データ範囲で変化させ、その他の条件は入力値に固定して表示します。'
-                : '選んだ1条件を全データ範囲で変化させ、その他の条件は入力値に固定して表示します。';
+                ? '選んだ2条件の予測面を作り、その他の条件は上の固定値を使います。'
+                : '選んだ条件を変化させ、その他の条件は上の固定値を使います。';
             if (predictionAvailable) clearPredictionGraph();
             document.getElementById('drawGraphBtn').disabled = !predictionAvailable;
         }
@@ -388,6 +475,7 @@
             const graph = document.getElementById('predictionGraph');
             if (window.Plotly) Plotly.purge(graph);
             graph.replaceChildren();
+            document.getElementById('graphWarning').style.display = 'none';
             document.getElementById('drawGraphBtn').disabled = !predictionAvailable;
         }
 
@@ -414,13 +502,15 @@
                     body: JSON.stringify({
                         experiment_id,
                         training_points,
-                        conditions
+                        conditions,
+                        model_type: document.getElementById('modelSelect').value
                     })
                 });
 
                 const result = await response.json();
 
                 if (response.ok) {
+                    activeModelType = result.model_type;
                     renderPredictionResults(result);
                     predictionAvailable = true;
                     document.getElementById('drawGraphBtn').disabled = false;
@@ -440,6 +530,9 @@
             const container = document.getElementById('predictionResults');
             trainingRanges = data.training_ranges || {};
             const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            [...document.querySelectorAll('#conditionFields input')].forEach(
+                updateConditionRangeHint
+            );
             updateGraphControls(
                 JSON.parse(selected?.dataset.inputColumns || '[]'),
                 JSON.parse(selected?.dataset.targetColumns || '[]')
@@ -448,6 +541,22 @@
             summary.style.color = '#64748b';
             summary.textContent =
                 `入力した条件: ${Object.entries(data.input_conditions).map(([name, value]) => `${name} = ${value}`).join('、')} / 学習に使用: ${data.training_points}行`;
+            const modelSummary = document.createElement('p');
+            modelSummary.style.color = '#475569';
+            modelSummary.textContent =
+                `使用モデル: ${data.model_label}` +
+                (data.validation_available
+                    ? ` / CSV単位の検証: ${data.validation_runs}分割で比較`
+                    : ' / 複数CSVがないため、CSV単位の精度検証はできていません');
+            modelSummary.textContent +=
+                ' / 予測区間はモデル推定と検証誤差を反映し、実測の保証ではありません';
+            if (data.model_parameters) {
+                const parameters = data.model_parameters;
+                modelSummary.textContent +=
+                    ` / 推定値: R=${Number(parameters.resistance_ohm).toPrecision(4)}Ω` +
+                    `、時定数=${Number(parameters.time_constant_s).toPrecision(4)}秒` +
+                    `、C=${Number(parameters.capacitance_f).toPrecision(4)}F`;
+            }
             const outOfRange = Object.entries(data.out_of_range_conditions || {});
             const warning = document.createElement('p');
             warning.style.cssText = 'color:#b45309; background:#fff7ed; padding:10px; border-radius:8px;';
@@ -475,7 +584,27 @@
                     cell.textContent = text;
                 });
             });
-            container.replaceChildren(summary, warning, table);
+            const evaluation = document.createElement('table');
+            const evaluationHeader = evaluation.createTHead().insertRow();
+            ['モデル', 'CSV単位の検証誤差（対象範囲で正規化）'].forEach(text => {
+                const cell = document.createElement('th');
+                cell.textContent = text;
+                evaluationHeader.append(cell);
+            });
+            const evaluationBody = evaluation.createTBody();
+            (data.model_evaluation || []).forEach(candidate => {
+                const row = evaluationBody.insertRow();
+                row.insertCell().textContent = candidate.label;
+                row.insertCell().textContent =
+                    `${(candidate.normalized_rmse * 100).toPrecision(4)}%`;
+            });
+            container.replaceChildren(
+                summary,
+                modelSummary,
+                warning,
+                table,
+                ...(data.model_evaluation?.length ? [evaluation] : [])
+            );
         }
 
         async function drawPredictionGraph() {
@@ -496,6 +625,7 @@
                         experiment_id: select.value,
                         training_points: Number(document.getElementById('trainingPoints').value),
                         conditions,
+                        model_type: activeModelType || document.getElementById('modelSelect').value,
                         x_column: document.getElementById('xAxisSelect').value,
                         y_column: dimension === '2'
                             ? document.getElementById('yAxisSelect').value
@@ -651,6 +781,22 @@
                     ...Object.keys(data.out_of_range_conditions || {}),
                     ...Object.keys(data.out_of_range_axes || {})
                 ];
+                const graphWarning = document.getElementById('graphWarning');
+                const warningDetails = [
+                    ...Object.entries(data.out_of_range_conditions || {}).map(
+                        ([name, value]) =>
+                            `${name}=${value}（学習範囲 ${data.training_ranges[name].join('～')}）`
+                    ),
+                    ...Object.entries(data.out_of_range_axes || {}).map(
+                        ([name, range]) =>
+                            `${name}=${range[0]}～${range[1]}（学習範囲 ${data.training_ranges[name].join('～')}）`
+                    )
+                ];
+                graphWarning.style.display = outOfRange.length ? 'block' : 'none';
+                graphWarning.textContent = outOfRange.length
+                    ? `学習データの範囲外です（${warningDetails.join('、')}）。` +
+                        '外挿の予測は不確かで、表示された予測区間も正しさを保証しません。'
+                    : '';
                 document.getElementById('graphHelp').textContent =
                     `全${data.total_points}行から${data.training_points}点で予測` +
                     (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '') +
@@ -676,6 +822,15 @@
         }
 
         document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
+        document.getElementById('modelSelect').addEventListener('change', () => {
+            document.getElementById('predictionResults').replaceChildren();
+            predictionAvailable = false;
+            activeModelType = null;
+            clearPredictionGraph();
+            document.getElementById('graphHelp').textContent =
+                '予測モデルを変更しました。再度予測してください。';
+            updatePredictButton();
+        });
         document.getElementById('trainingPoints').addEventListener('input', () => {
             document.getElementById('predictionResults').replaceChildren();
             predictionAvailable = false;

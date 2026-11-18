@@ -35,7 +35,10 @@ from openpyxl.chart import ScatterChart, Series, Reference
 # プログラムから綺麗なエクセルファイルを制作したりグラフを自動で書かせたりするための道具
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import PolynomialFeatures
 from sklearn.preprocessing import StandardScaler
+from scipy.optimize import least_squares
 # 機械学習の機能、ガウス過程回帰を読み出している
 
 app = Flask(__name__)
@@ -43,7 +46,14 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 MAX_GPR_TRAINING_POINTS = 1000
 DEFAULT_GPR_TRAINING_POINTS = 250
+MAX_VALIDATION_POINTS = 300
 MIN_EXPERIMENT_POINTS = 5
+
+MODEL_LABELS = {
+    "gpr": "汎用ガウス過程（補間向け）",
+    "polynomial": "2次多項式回帰",
+    "rc_parallel": "並列RC回路モデル"
+}
 
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20000000)
 
@@ -197,6 +207,9 @@ def resolve_axis_range(requested_range, axis_values):
     observed_min = float(np.min(axis_values))
     observed_max = float(np.max(axis_values))
     if requested_range is None:
+        if observed_min == observed_max:
+            padding = max(abs(observed_min) * 0.1, 0.5)
+            return observed_min - padding, observed_max + padding
         return observed_min, observed_max
     if not isinstance(requested_range, list) or len(requested_range) != 2:
         raise ValueError("グラフの範囲は最小値と最大値を指定してください。")
@@ -210,7 +223,364 @@ def resolve_axis_range(requested_range, axis_values):
         raise ValueError("グラフ範囲の最小値は最大値より小さくしてください。")
     return low, high
 
-def get_experiment_model(spec, input_columns, target_columns, input_values, target_values, requested_points):
+def find_rc_columns(input_columns, target_columns):
+    def normalized(column):
+        return "".join(character for character in column.lower() if character.isalnum())
+
+    current_columns = [
+        index for index, column in enumerate(input_columns)
+        if "current" in normalized(column)
+        or "ampere" in normalized(column)
+        or "電流" in normalized(column)
+        or normalized(column).startswith("amps")
+        or normalized(column) in {"amp", "ia", "iamp"}
+    ]
+    time_columns = [
+        index for index, column in enumerate(input_columns)
+        if any(token in normalized(column) for token in ("time", "elapsed", "時間"))
+        or normalized(column) in {"t", "ts", "tsec", "秒"}
+    ]
+    voltage_columns = [
+        index for index, column in enumerate(target_columns)
+        if any(token in normalized(column) for token in ("voltage", "volt", "電圧"))
+        or normalized(column) in {"v", "vc", "vout"}
+    ]
+    if (
+        len(current_columns) != 1
+        or len(time_columns) != 1
+        or len(voltage_columns) != 1
+        or len(target_columns) != 1
+    ):
+        return None
+    return current_columns[0], time_columns[0], voltage_columns[0]
+
+
+def fit_rc_parallel_model(input_values, target_values, input_columns, target_columns):
+    indices = find_rc_columns(input_columns, target_columns)
+    if indices is None:
+        raise ValueError(
+            "RC回路モデルには、条件列の電流・時間と結果列の電圧を識別できる列名が必要です。"
+        )
+    if target_values.shape[1] != 1 or len(input_values) < 5:
+        raise ValueError("RC回路モデルは電圧1列、測定データ5行以上で使用できます。")
+
+    current_index, time_index, voltage_index = indices
+    current = input_values[:, current_index]
+    time = input_values[:, time_index]
+    voltage = target_values[:, voltage_index]
+    if np.any(time < 0) or len(np.unique(time)) < 3 or np.allclose(current, 0):
+        raise ValueError("RC回路モデルには、0以上の時間と変化のある電流データが必要です。")
+
+    initial_offset = float(voltage[np.argmin(time)])
+    current_scale = max(float(np.max(np.abs(current))), 1e-9)
+    resistance_guess = max(
+        float(np.ptp(voltage)) / current_scale,
+        1e-6
+    )
+    time_constant_guess = max(float(np.ptp(time)) / 3, 1e-3)
+
+    def calculate(parameters, current_values, time_values):
+        resistance, time_constant = np.exp(parameters[:2])
+        offset = parameters[2]
+        return offset + current_values * resistance * (
+            -np.expm1(-time_values / time_constant)
+        )
+
+    fit = least_squares(
+        lambda parameters: calculate(parameters, current, time) - voltage,
+        x0=[
+            np.log(resistance_guess),
+            np.log(time_constant_guess),
+            initial_offset
+        ],
+        bounds=([-30, -30, -np.inf], [30, 30, np.inf]),
+        max_nfev=5000
+    )
+    if not fit.success or not np.all(np.isfinite(fit.x)):
+        raise ValueError("RC回路の抵抗と時定数をデータから推定できませんでした。")
+
+    residuals = calculate(fit.x, current, time) - voltage
+    degrees_of_freedom = max(len(voltage) - len(fit.x), 1)
+    residual_variance = float(np.dot(residuals, residuals) / degrees_of_freedom)
+    covariance = residual_variance * np.linalg.pinv(fit.jac.T @ fit.jac)
+    resistance, time_constant = np.exp(fit.x[:2])
+    return {
+        "type": "rc_parallel",
+        "current_index": current_index,
+        "time_index": time_index,
+        "voltage_index": voltage_index,
+        "resistance": float(resistance),
+        "time_constant": float(time_constant),
+        "offset": float(fit.x[2]),
+        "covariance": covariance,
+        "residual_variance": residual_variance
+    }
+
+
+def fit_experiment_candidate(
+    model_type,
+    input_values,
+    target_values,
+    input_columns,
+    target_columns,
+    optimize_gpr=True
+):
+    if model_type == "rc_parallel":
+        return fit_rc_parallel_model(
+            input_values, target_values, input_columns, target_columns
+        )
+
+    scaler = StandardScaler()
+    scaled_values = scaler.fit_transform(input_values)
+    if model_type == "gpr":
+        kernel = (
+            C(1.0, (1e-3, 1e3))
+            * RBF(np.ones(len(input_columns)), (1e-2, 1e2))
+            + WhiteKernel(noise_level=0.1)
+        )
+        model = GaussianProcessRegressor(
+            kernel=kernel,
+            n_restarts_optimizer=1 if optimize_gpr else 0,
+            alpha=1e-6,
+            normalize_y=True
+        )
+        model.fit(scaled_values, target_values)
+        return {
+            "type": model_type,
+            "scaler": scaler,
+            "estimator": model
+        }
+    if model_type == "polynomial":
+        polynomial = PolynomialFeatures(degree=2, include_bias=False)
+        features = polynomial.fit_transform(scaled_values)
+        target_scaler = StandardScaler()
+        scaled_targets = target_scaler.fit_transform(target_values)
+        estimator = Ridge(alpha=1.0)
+        estimator.fit(features, scaled_targets)
+        residuals = target_values - target_scaler.inverse_transform(
+            np.asarray(estimator.predict(features)).reshape(len(features), -1)
+        )
+        residual_std = np.sqrt(np.mean(np.square(residuals), axis=0))
+        return {
+            "type": model_type,
+            "scaler": scaler,
+            "polynomial": polynomial,
+            "target_scaler": target_scaler,
+            "estimator": estimator,
+            "residual_std": residual_std
+        }
+    raise ValueError("指定した予測モデルは利用できません。")
+
+
+def predict_experiment_candidate(model, input_values):
+    model_type = model["type"]
+    if model_type == "rc_parallel":
+        current = input_values[:, model["current_index"]]
+        time = input_values[:, model["time_index"]]
+        resistance = model["resistance"]
+        time_constant = model["time_constant"]
+        decay = np.exp(-time / time_constant)
+        amplitude = current * resistance
+        response = amplitude * (1 - decay)
+        mean = (model["offset"] + response).reshape(-1, 1)
+        gradient = np.column_stack((
+            response,
+            -amplitude * decay * time / time_constant,
+            np.ones(len(time))
+        ))
+        parameter_variance = np.einsum(
+            "ij,jk,ik->i",
+            gradient,
+            model["covariance"],
+            gradient
+        )
+        std = np.sqrt(np.maximum(
+            parameter_variance + model["residual_variance"],
+            0
+        )).reshape(-1, 1)
+        return mean, std
+
+    scaled_values = model["scaler"].transform(input_values)
+    if model_type == "gpr":
+        mean, std = model["estimator"].predict(scaled_values, return_std=True)
+        mean = np.asarray(mean)
+        std = np.asarray(std)
+        if mean.ndim == 1:
+            mean = mean.reshape(-1, 1)
+            std = std.reshape(-1, 1)
+        return mean, std
+
+    features = model["polynomial"].transform(scaled_values)
+    scaled_mean = model["estimator"].predict(features)
+    mean = model["target_scaler"].inverse_transform(
+        np.asarray(scaled_mean).reshape(len(input_values), -1)
+    )
+    std = np.tile(model["residual_std"], (len(input_values), 1))
+    return mean, std
+
+
+def get_run_slices(spec, row_count):
+    runs = spec.get("runs", [])
+    run_lengths = [run.get("row_count") for run in runs]
+    if len(runs) < 2 or any(
+        isinstance(length, bool) or not isinstance(length, int) or length < 1
+        for length in run_lengths
+    ) or sum(run_lengths) != row_count:
+        return []
+
+    slices = []
+    start = 0
+    for length in run_lengths:
+        slices.append(slice(start, start + length))
+        start += length
+    return slices
+
+
+model_validation_cache = {"cache_key": None, "result": None}
+
+
+def validate_experiment_models(
+    spec,
+    input_columns,
+    target_columns,
+    input_values,
+    target_values,
+    requested_points
+):
+    run_slices = get_run_slices(spec, len(input_values))
+    if not run_slices:
+        return {
+            "available": False,
+            "fold_count": 0,
+            "candidates": [],
+            "best_model": None,
+            "residual_q95": {}
+        }
+
+    source_files = tuple(
+        str(run["csv_file_id"]) for run in spec.get("runs", [])
+    )
+    cache_key = (
+        str(spec["_id"]),
+        source_files,
+        tuple(input_columns),
+        tuple(target_columns),
+        requested_points
+    )
+    if model_validation_cache["cache_key"] == cache_key:
+        return model_validation_cache["result"]
+
+    candidate_types = ["gpr", "polynomial"]
+    if find_rc_columns(input_columns, target_columns) is not None:
+        candidate_types.append("rc_parallel")
+
+    candidates = []
+    target_scales = np.ptp(target_values, axis=0)
+    fallback_scales = np.std(target_values, axis=0)
+    target_scales = np.where(
+        target_scales > 1e-12,
+        target_scales,
+        np.where(fallback_scales > 1e-12, fallback_scales, 1.0)
+    )
+
+    for model_type in candidate_types:
+        errors = []
+        fold_rmses = []
+        fold_count = 0
+        failed = False
+        for held_out in run_slices:
+            train_mask = np.ones(len(input_values), dtype=bool)
+            train_mask[held_out] = False
+            train_values = input_values[train_mask]
+            train_targets = target_values[train_mask]
+            test_values = input_values[held_out]
+            test_targets = target_values[held_out]
+            if len(test_values) > MAX_VALIDATION_POINTS:
+                test_values, test_targets = select_evenly_spaced_rows(
+                    test_values,
+                    test_targets,
+                    MAX_VALIDATION_POINTS
+                )
+            if len(train_values) < MIN_EXPERIMENT_POINTS:
+                failed = True
+                break
+
+            fold_points = min(
+                len(train_values),
+                requested_points,
+                MAX_VALIDATION_POINTS
+            )
+            train_values, train_targets = select_evenly_spaced_rows(
+                train_values, train_targets, fold_points
+            )
+            try:
+                model = fit_experiment_candidate(
+                    model_type,
+                    train_values,
+                    train_targets,
+                    input_columns,
+                    target_columns,
+                    optimize_gpr=False
+                )
+                predicted, _ = predict_experiment_candidate(model, test_values)
+            except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+                failed = True
+                break
+
+            fold_errors = predicted - test_targets
+            errors.append(fold_errors)
+            fold_rmses.append(np.sqrt(np.mean(np.square(fold_errors), axis=0)))
+            fold_count += 1
+
+        if failed or fold_count != len(run_slices):
+            continue
+        absolute_errors = np.abs(np.concatenate(errors, axis=0))
+        rmse = np.mean(fold_rmses, axis=0)
+        candidates.append({
+            "model_type": model_type,
+            "label": MODEL_LABELS[model_type],
+            "normalized_rmse": float(np.mean(rmse / target_scales)),
+            "rmse_by_target": {
+                column: float(value)
+                for column, value in zip(target_columns, rmse)
+            },
+            "residual_q95": {
+                column: float(np.quantile(
+                    absolute_errors[:, index],
+                    0.95,
+                    method="higher"
+                ))
+                for index, column in enumerate(target_columns)
+            },
+            "fold_count": fold_count
+        })
+
+    result = {
+        "available": bool(candidates),
+        "fold_count": len(run_slices),
+        "candidates": candidates,
+        "best_model": min(
+            candidates,
+            key=lambda candidate: candidate["normalized_rmse"]
+        )["model_type"] if candidates else None,
+        "residual_q95": {
+            candidate["model_type"]: candidate["residual_q95"]
+            for candidate in candidates
+        }
+    }
+    model_validation_cache.update({"cache_key": cache_key, "result": result})
+    return result
+
+
+def get_experiment_model(
+    spec,
+    input_columns,
+    target_columns,
+    input_values,
+    target_values,
+    requested_points,
+    model_type="gpr"
+):
     source_files = tuple(
         str(run["csv_file_id"]) for run in spec.get("runs", [])
     ) or (str(spec.get("csv_file_id", "legacy")),)
@@ -219,34 +589,105 @@ def get_experiment_model(spec, input_columns, target_columns, input_values, targ
         source_files,
         tuple(input_columns),
         tuple(target_columns),
-        requested_points
+        requested_points,
+        model_type
     )
     if model_cache["cache_key"] != cache_key or model_cache.get("gp_model") is None:
-        print("🔄 実験データから多次元・複数結果のGPRモデルを学習します...")
+        print(f"🔄 実験データから{MODEL_LABELS[model_type]}を学習します...")
         x_train, y_train = select_evenly_spaced_rows(
             input_values, target_values, requested_points
         )
-        scaler = StandardScaler()
-        scaled_train = scaler.fit_transform(x_train)
-        kernel = (
-            C(1.0, (1e-3, 1e3))
-            * RBF(np.ones(len(input_columns)), (1e-2, 1e2))
-            + WhiteKernel(noise_level=0.1)
+        model = fit_experiment_candidate(
+            model_type,
+            x_train,
+            y_train,
+            input_columns,
+            target_columns
         )
-        gp = GaussianProcessRegressor(
-            kernel=kernel,
-            n_restarts_optimizer=1,
-            alpha=1e-6,
-            normalize_y=True
-        )
-        gp.fit(scaled_train, y_train)
         model_cache["cache_key"] = cache_key
-        model_cache["scaler"] = scaler
-        model_cache["gp_model"] = gp
+        model_cache["scaler"] = model.get("scaler")
+        model_cache["gp_model"] = model
     else:
-        print("⚡ キャッシュされたGPRモデルを使用します")
+        print(f"⚡ キャッシュされた{MODEL_LABELS[model_type]}モデルを使用します")
 
     return model_cache["scaler"], model_cache["gp_model"]
+
+
+def prepare_experiment_model(
+    spec,
+    input_columns,
+    target_columns,
+    input_values,
+    target_values,
+    requested_points,
+    requested_model
+):
+    if requested_model not in {"auto", *MODEL_LABELS}:
+        raise ValueError("予測モデルを選び直してください。")
+    validation = validate_experiment_models(
+        spec,
+        input_columns,
+        target_columns,
+        input_values,
+        target_values,
+        requested_points
+    )
+    if requested_model == "auto":
+        model_type = validation["best_model"] or "gpr"
+        selection_reason = (
+            "run_holdout" if validation["best_model"] else "validation_unavailable"
+        )
+    else:
+        model_type = requested_model
+        selection_reason = "user_selected"
+    if model_type == "rc_parallel" and find_rc_columns(
+        input_columns, target_columns
+    ) is None:
+        raise ValueError(
+            "RC回路モデルには、条件列の電流・時間と結果列の電圧を識別できる列名が必要です。"
+        )
+
+    _, model = get_experiment_model(
+        spec,
+        input_columns,
+        target_columns,
+        input_values,
+        target_values,
+        requested_points,
+        model_type
+    )
+    return model_type, selection_reason, model, validation
+
+
+def include_validation_uncertainty(std_values, validation, model_type, target_columns):
+    residual_q95 = validation.get("residual_q95", {}).get(model_type)
+    if not residual_q95:
+        return std_values
+    calibration = np.asarray(
+        [residual_q95[column] for column in target_columns],
+        dtype=float
+    ) / 1.96
+    calibration = calibration.reshape((1,) * (std_values.ndim - 1) + (-1,))
+    return np.maximum(std_values, calibration)
+
+
+def prediction_model_metadata(model_type, selection_reason, validation, model):
+    metadata = {
+        "model_type": model_type,
+        "model_label": MODEL_LABELS[model_type],
+        "model_selection_reason": selection_reason,
+        "validation_available": validation["available"],
+        "validation_runs": validation["fold_count"],
+        "model_evaluation": validation["candidates"]
+    }
+    if model_type == "rc_parallel":
+        metadata["model_parameters"] = {
+            "resistance_ohm": model["resistance"],
+            "time_constant_s": model["time_constant"],
+            "capacitance_f": model["time_constant"] / model["resistance"]
+        }
+    return metadata
+
 
 def load_experiment_table(spec):
     input_columns = spec.get("input_columns")
@@ -959,14 +1400,27 @@ def predict_dynamic():
         if not np.all(np.isfinite(query_values)):
             return {"error": "実験条件に無効な数値があります。"}, 400
 
-        scaler, gp_model = get_experiment_model(
-            spec, input_columns, target_columns,
-            input_values, target_values, requested_points
-        )
+        try:
+            model_type, selection_reason, model, validation = prepare_experiment_model(
+                spec,
+                input_columns,
+                target_columns,
+                input_values,
+                target_values,
+                requested_points,
+                req_data.get("model_type", "auto")
+            )
+        except ValueError as error:
+            return {"error": str(error)}, 400
         query = np.asarray([query_values], dtype=float)
-        y_pred, y_std = gp_model.predict(scaler.transform(query), return_std=True)
+        y_pred, y_std = predict_experiment_candidate(model, query)
         prediction_values = np.asarray(y_pred).reshape(-1)
-        std_values = np.asarray(y_std).reshape(-1)
+        std_values = include_validation_uncertainty(
+            np.asarray(y_std),
+            validation,
+            model_type,
+            target_columns
+        ).reshape(-1)
 
         training_ranges = {
             column: [
@@ -987,6 +1441,9 @@ def predict_dynamic():
             "input_conditions": dict(zip(input_columns, query_values)),
             "training_ranges": training_ranges,
             "out_of_range_conditions": out_of_range_conditions,
+            **prediction_model_metadata(
+                model_type, selection_reason, validation, model
+            ),
             "predictions": dict(zip(target_columns, prediction_values.tolist())),
             "confidence_high": dict(zip(
                 target_columns,
@@ -1098,16 +1555,26 @@ def predict_grid():
             queries[:, x_index] = x_mesh.ravel()
             queries[:, y_index] = y_mesh.ravel()
 
-        scaler, gp_model = get_experiment_model(
-            spec, input_columns, target_columns,
-            input_values, target_values, requested_points
-        )
-        predicted, predicted_std = gp_model.predict(
-            scaler.transform(queries),
-            return_std=True
-        )
+        try:
+            model_type, selection_reason, model, validation = prepare_experiment_model(
+                spec,
+                input_columns,
+                target_columns,
+                input_values,
+                target_values,
+                requested_points,
+                req_data.get("model_type", "auto")
+            )
+        except ValueError as error:
+            return {"error": str(error)}, 400
+        predicted, predicted_std = predict_experiment_candidate(model, queries)
         prediction_values = np.asarray(predicted)
-        std_values = np.asarray(predicted_std)
+        std_values = include_validation_uncertainty(
+            np.asarray(predicted_std),
+            validation,
+            model_type,
+            target_columns
+        )
 
         if prediction_values.ndim == 1:
             prediction_values = prediction_values.reshape(-1, 1)
@@ -1156,6 +1623,9 @@ def predict_grid():
             "training_ranges": training_ranges,
             "out_of_range_conditions": out_of_range_conditions,
             "out_of_range_axes": out_of_range_axes,
+            **prediction_model_metadata(
+                model_type, selection_reason, validation, model
+            ),
             "fixed_conditions": {
                 column: float(fixed_values[index])
                 for index, column in enumerate(input_columns)
