@@ -148,6 +148,25 @@ class ExperimentCsvTests(unittest.TestCase):
             (0.5, 1.5)
         )
 
+    def test_gaussian_prediction_interval_uses_gpr_posterior_std_directly(self):
+        interval = app_module.gaussian_prediction_interval(
+            np.array([[10.0]]),
+            np.array([[2.0]])
+        )
+
+        self.assertAlmostEqual(interval["lower"][0, 0], 6.08)
+        self.assertAlmostEqual(interval["upper"][0, 0], 13.92)
+        self.assertEqual(interval["level"], 0.95)
+
+    def test_prediction_page_defaults_to_gpr_and_offers_model_comparison(self):
+        response = app_module.app.test_client().get("/predict")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('option value="gpr" selected', html)
+        self.assertIn('value="random_forest"', html)
+        self.assertIn("互換データを一括選択", html)
+
     def test_creates_file_for_legacy_database_experiment(self):
         spec = {
             "_id": "legacy-experiment",
@@ -218,6 +237,204 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(listed_experiment["input_columns"], ["temperature", "field"])
         self.assertEqual(listed_experiment["target_columns"], ["permeability", "loss"])
         self.assertEqual(listed_experiment["point_count"], 5)
+        self.assertIn("run_id", response.json)
+
+    def test_run_graph_api_loads_a_single_csv(self):
+        file_id = ObjectId()
+        run_id = "run-one"
+        app_module.fs.files[file_id] = (
+            b"time_s,current_A,voltage_V\n0,1,0\n1,1,0.5\n"
+        )
+        group = {
+            "_id": ObjectId(),
+            "experiment_name": "RC",
+            "input_columns": ["time_s", "current_A"],
+            "target_columns": ["voltage_V"],
+            "runs": [{
+                "run_id": run_id,
+                "csv_file_id": file_id,
+                "csv_filename": "one-amp.csv",
+                "row_count": 2
+            }]
+        }
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection([group])
+        )
+
+        response = app_module.app.test_client().get(
+            f"/api/experiments/{group['_id']}/runs/{run_id}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["filename"], "one-amp.csv")
+        self.assertEqual(response.json["row_count"], 2)
+        self.assertEqual(response.json["input_values"], [[0.0, 1.0], [1.0, 1.0]])
+        self.assertEqual(response.json["target_values"], [[0.0], [0.5]])
+
+    def test_data_management_lists_each_run_with_its_own_point_count(self):
+        group_id = ObjectId()
+        runs = []
+        for index in range(2):
+            file_id = ObjectId()
+            app_module.fs.files[file_id] = b"time_s,voltage_V\n0,0\n1,1\n"
+            runs.append({
+                "run_id": f"run-{index}",
+                "csv_file_id": file_id,
+                "csv_filename": f"run-{index}.csv",
+                "row_count": 21
+            })
+        group = {
+            "_id": group_id,
+            "project_name": "project",
+            "material_name": "sample",
+            "domain": "EMC",
+            "experiment_name": "current",
+            "input_columns": ["time_s"],
+            "target_columns": ["voltage_V"],
+            "row_count": 42,
+            "runs": runs
+        }
+        app_module.db = SimpleNamespace(
+            images=FakeSpectrumCollection([]),
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection([group])
+        )
+        client = app_module.socketio.test_client(app_module.app)
+        self.addCleanup(client.disconnect)
+
+        client.emit("load messages")
+        messages = next(
+            event["args"][0]
+            for event in client.get_received()
+            if event["name"] == "load all messages"
+        )
+        csv_runs = [message for message in messages if message.get("run_id")]
+
+        self.assertEqual([message["row_count"] for message in csv_runs], [21, 21])
+        self.assertEqual([message["group_row_count"] for message in csv_runs], [42, 42])
+
+    def test_prediction_pools_multiple_compatible_datasets(self):
+        groups = []
+        for dataset_index in range(2):
+            file_id = ObjectId()
+            rows = ["x,y"]
+            rows.extend(
+                f"{dataset_index * 5 + value},{2 * (dataset_index * 5 + value)}"
+                for value in range(5)
+            )
+            app_module.fs.files[file_id] = "\n".join(rows).encode()
+            groups.append({
+                "_id": ObjectId(),
+                "project_name": "same-project",
+                "experiment_name": f"dataset-{dataset_index}",
+                "material_name": "sample",
+                "domain": "MI",
+                "input_columns": ["x"],
+                "target_columns": ["y"],
+                "row_count": 5,
+                "runs": [{
+                    "run_id": f"run-{dataset_index}",
+                    "csv_file_id": file_id,
+                    "csv_filename": f"run-{dataset_index}.csv",
+                    "row_count": 5
+                }]
+            })
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection(groups)
+        )
+        app_module.model_cache = {"cache_key": None, "gp_model": None, "scaler": None}
+
+        response = app_module.app.test_client().post(
+            "/api/predict_dynamic",
+            json={
+                "experiment_ids": [str(group["_id"]) for group in groups],
+                "training_points": 10,
+                "conditions": {"x": 4},
+                "model_type": "polynomial"
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["total_points"], 10)
+        self.assertEqual(response.json["training_run_count"], 2)
+        self.assertEqual(
+            response.json["experiment_ids"],
+            [str(group["_id"]) for group in groups]
+        )
+        self.assertIsNone(response.json["prediction_interval"])
+        self.assertEqual(
+            {candidate["model_type"] for candidate in response.json["model_evaluation"]},
+            {"gpr", "polynomial", "random_forest"}
+        )
+
+    def test_prediction_rejects_mixed_project_datasets(self):
+        groups = []
+        for project_name in ("project-a", "project-b"):
+            groups.append({
+                "_id": ObjectId(),
+                "project_name": project_name,
+                "input_columns": ["x"],
+                "target_columns": ["y"],
+                "runs": [{
+                    "input_values": [[0], [1], [2], [3], [4]],
+                    "target_values": [[0], [1], [2], [3], [4]],
+                    "row_count": 5
+                }]
+            })
+        app_module.db = SimpleNamespace(
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection(groups)
+        )
+
+        response = app_module.app.test_client().post(
+            "/api/predict_dynamic",
+            json={
+                "experiment_ids": [str(group["_id"]) for group in groups],
+                "training_points": 10,
+                "conditions": {"x": 2},
+                "model_type": "gpr"
+            }
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("同じプロジェクト", response.json["error"])
+
+    def test_deleting_a_run_preserves_other_runs_in_its_training_set(self):
+        group_id = ObjectId()
+        file_ids = [ObjectId(), ObjectId()]
+        runs = [{
+            "run_id": f"run-{index}",
+            "csv_file_id": file_id,
+            "row_count": 21
+        } for index, file_id in enumerate(file_ids)]
+        for file_id in file_ids:
+            app_module.fs.files[file_id] = b"time_s,voltage_V\n0,0\n"
+        group = {
+            "_id": group_id,
+            "row_count": 42,
+            "run_count": 2,
+            "runs": runs
+        }
+        app_module.db = SimpleNamespace(
+            images=FakeSpectrumCollection([]),
+            spectrums=FakeSpectrumCollection([]),
+            experiment_groups=FakeExperimentGroupCollection([group])
+        )
+        client = app_module.socketio.test_client(app_module.app)
+        self.addCleanup(client.disconnect)
+
+        client.emit(
+            "delete message",
+            {"id": str(group_id), "run_id": "run-0"}
+        )
+
+        self.assertEqual(group["row_count"], 21)
+        self.assertEqual(group["run_count"], 1)
+        self.assertEqual(group["runs"][0]["run_id"], "run-1")
+        self.assertNotIn(file_ids[0], app_module.fs.files)
+        self.assertIn(file_ids[1], app_module.fs.files)
 
     def test_combines_separate_runs_and_predicts_an_unmeasured_input(self):
         app_module.db = SimpleNamespace(
@@ -298,34 +515,26 @@ class ExperimentCsvTests(unittest.TestCase):
         self.assertEqual(response.json["training_ranges"]["current"], [1, 3])
         self.assertEqual(response.json["out_of_range_conditions"], {"current": 5})
 
-    def test_rc_model_fits_shared_parameters_and_predicts_five_amps(self):
-        times = np.tile(np.arange(21, dtype=float) * 0.25, 2)
-        currents = np.repeat([1.0, 3.0], 21)
-        input_values = np.column_stack((currents, times))
-        target_values = (
-            currents * 1.5 * (1 - np.exp(-times / 2))
-        ).reshape(-1, 1)
-        input_columns = ["current_A", "time_s"]
-        target_columns = ["voltage_V"]
-
-        model = app_module.fit_rc_parallel_model(
-            input_values, target_values, input_columns, target_columns
+    def test_gpr_posterior_uncertainty_grows_outside_training_region(self):
+        input_values = np.linspace(0, 5, 21).reshape(-1, 1)
+        target_values = np.sin(input_values)
+        model = app_module.fit_experiment_candidate(
+            "gpr",
+            input_values,
+            target_values,
+            ["time_s"],
+            ["voltage_V"],
+            optimize_gpr=False
         )
-        predicted, predicted_std = app_module.predict_experiment_candidate(
+        _, standard_deviation = app_module.predict_experiment_candidate(
             model,
-            np.array([[5.0, 5.0], [5.0, 15.0]])
+            np.array([[2.5], [15.0]])
         )
 
-        self.assertAlmostEqual(model["resistance"], 1.5, places=5)
-        self.assertAlmostEqual(model["time_constant"], 2.0, places=5)
-        np.testing.assert_allclose(
-            predicted[:, 0],
-            [6.8844, 7.4959],
-            atol=0.0001
-        )
-        self.assertTrue(np.all(np.isfinite(predicted_std)))
+        self.assertIsNotNone(standard_deviation)
+        self.assertGreater(standard_deviation[1, 0], standard_deviation[0, 0])
 
-    def test_auto_selection_uses_whole_run_validation(self):
+    def test_model_comparison_uses_whole_run_validation(self):
         times = np.tile(np.arange(21, dtype=float) * 0.25, 2)
         currents = np.repeat([1.0, 3.0], 21)
         input_values = np.column_stack((currents, times))
@@ -352,16 +561,14 @@ class ExperimentCsvTests(unittest.TestCase):
 
         self.assertTrue(validation["available"])
         self.assertEqual(validation["fold_count"], 2)
-        self.assertEqual(validation["best_model"], "rc_parallel")
         self.assertEqual(
             {candidate["model_type"] for candidate in validation["candidates"]},
-            {"gpr", "polynomial", "rc_parallel"}
+            {"gpr", "polynomial", "random_forest"}
         )
-        rc_result = next(
-            candidate for candidate in validation["candidates"]
-            if candidate["model_type"] == "rc_parallel"
-        )
-        self.assertLess(rc_result["rmse_by_target"]["voltage_V"], 1e-10)
+        self.assertTrue(all(
+            np.isfinite(candidate["normalized_rmse"])
+            for candidate in validation["candidates"]
+        ))
         app_module.model_cache = {
             "cache_key": None,
             "gp_model": None,
@@ -379,11 +586,11 @@ class ExperimentCsvTests(unittest.TestCase):
         prediction, _ = app_module.predict_experiment_candidate(
             model, np.array([[5.0, 15.0]])
         )
-        self.assertEqual(selected_model, "rc_parallel")
+        self.assertIn(selected_model, {"gpr", "polynomial", "random_forest"})
         self.assertEqual(reason, "run_holdout")
-        self.assertAlmostEqual(prediction[0, 0], 7.4959, places=4)
+        self.assertTrue(np.isfinite(prediction[0, 0]))
 
-    def test_prediction_grid_uses_rc_model_and_reports_both_extrapolations(self):
+    def test_prediction_grid_returns_gpr_interval_and_measured_runs(self):
         run_files = [ObjectId(), ObjectId()]
         runs = []
         for current, file_id in zip([1.0, 3.0], run_files):
@@ -426,24 +633,23 @@ class ExperimentCsvTests(unittest.TestCase):
                 "y_column": None,
                 "x_range": [0, 15],
                 "grid_size": 5,
-                "model_type": "auto"
+                "model_type": "gpr"
             }
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["model_type"], "rc_parallel")
-        self.assertAlmostEqual(
-            response.json["model_parameters"]["resistance_ohm"],
-            1.5,
-            places=5
+        self.assertEqual(response.json["model_type"], "gpr")
+        self.assertEqual(
+            response.json["prediction_interval"]["method"],
+            "gaussian_process_posterior_predictive"
         )
         self.assertEqual(response.json["validation_runs"], 2)
         self.assertEqual(response.json["out_of_range_conditions"], {"current_A": 5})
         self.assertEqual(response.json["out_of_range_axes"], {"time_s": [0, 15]})
-        self.assertAlmostEqual(
-            response.json["predictions"]["voltage_V"][-1],
-            7.4959,
-            places=4
+        self.assertEqual(len(response.json["measured_data"]), 2)
+        self.assertEqual(
+            sum(len(run["x_values"]) for run in response.json["measured_data"]),
+            42
         )
 
     def test_imports_more_than_800_rows_but_caps_gpr_training_sample(self):
@@ -722,12 +928,22 @@ class ExperimentCsvTests(unittest.TestCase):
                 "conditions": conditions,
                 "x_column": "wavelength",
                 "y_column": None,
+                "target_column": "intensity",
+                "compare_models": True,
                 "grid_size": 5
             }
         )
         self.assertEqual(line.status_code, 200)
         self.assertIsNone(line.json["y_values"])
         self.assertEqual(len(line.json["predictions"]["intensity"]), 5)
+        self.assertEqual(
+            set(line.json["model_comparison_predictions"]),
+            {"gpr", "polynomial", "random_forest"}
+        )
+        self.assertEqual(
+            len(line.json["model_comparison_predictions"]["polynomial"]["intensity"]),
+            5
+        )
 
 
 if __name__ == "__main__":
