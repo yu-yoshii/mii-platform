@@ -60,6 +60,25 @@
             color: #64748b;
             font-size: 0.8em;
         }
+        #experimentOptions {
+            display: grid;
+            gap: 8px;
+            max-height: 220px;
+            overflow-y: auto;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: #f8fafc;
+        }
+        .experiment-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            font-size: 0.9em;
+        }
+        .experiment-option input {
+            margin-top: 3px;
+        }
         .btn-predict {
             background-color: var(--primary);
             color: white;
@@ -158,10 +177,14 @@
 
         <div class="control-group">
             <div class="input-box">
-                <label for="experimentSelect">学習対象の実験</label>
-                <select id="experimentSelect">
-                    <option value="">実験データを読み込み中...</option>
-                </select>
+                <label>学習対象データ（同じプロジェクト・列構成を複数選択可）</label>
+                <div id="experimentOptions">実験データを読み込み中...</div>
+                <button type="button" class="btn-predict" id="selectCompatibleDatasets" style="margin-top:8px;">
+                    互換データを一括選択
+                </button>
+                <small class="input-help" id="datasetSelectionHelp">
+                    複数CSVは各ファイルを検証単位として比較し、選択した行をまとめて学習します。
+                </small>
             </div>
             <div class="input-box">
                 <label for="trainingPoints">学習に使う点数</label>
@@ -172,12 +195,12 @@
                 <label for="modelSelect">予測モデル</label>
                 <select id="modelSelect">
                     <option value="auto">自動選択（CSV単位で検証）</option>
-                    <option value="gpr">汎用ガウス過程（補間向け）</option>
+                    <option value="gpr" selected>ガウス過程回帰（主モデル）</option>
                     <option value="polynomial">2次多項式回帰</option>
-                    <option value="rc_parallel">並列RC回路モデル</option>
+                    <option value="random_forest">ランダムフォレスト回帰</option>
                 </select>
                 <small class="input-help">
-                    自動選択はCSVを丸ごと外してモデルを比較します。RC回路モデルは理想的な定電流源＋R-C並列回路を仮定します。
+                    GPRの予測区間は事後予測分布から計算します。他モデルはCSV単位の検証誤差を比較し、予測区間は表示しません。
                 </small>
             </div>
             <p class="condition-explanation">
@@ -236,6 +259,10 @@
                     <select id="graphStyle"></select>
                 </div>
             </div>
+            <label id="compareModelsLabel" class="graph-help" style="display:block; margin-bottom:10px;">
+                <input type="checkbox" id="compareModels">
+                ほかのモデルの予測線も重ねて比較（1条件のグラフ）
+            </label>
             <button type="button" class="btn-predict" id="drawGraphBtn" onclick="drawPredictionGraph()" disabled>グラフを更新</button>
             <div class="prediction-warning" id="graphWarning" role="alert"></div>
             <div id="predictionGraph" role="img" aria-label="実験結果の予測グラフ"></div>
@@ -246,23 +273,32 @@
         let predictionAvailable = false;
         let trainingRanges = {};
         let activeModelType = null;
+        let availableExperiments = [];
 
-        function supportsRcParallelModel(inputColumns, targetColumns) {
-            const contains = (column, expressions) =>
-                expressions.some(expression => expression.test(column));
-            return inputColumns.filter(column =>
-                contains(column, [/current/i, /ampere/i, /^amps?/i, /電流/]) ||
-                ['ia', 'iamp'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
-            ).length === 1 &&
-                inputColumns.filter(column =>
-                    contains(column, [/time/i, /elapsed/i, /時間/]) ||
-                    ['t', 'ts', 'tsec'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
-                ).length === 1 &&
-                targetColumns.filter(column =>
-                    contains(column, [/voltage/i, /volt/i, /電圧/]) ||
-                    ['v', 'vc', 'vout'].includes(column.toLowerCase().replace(/[^a-z0-9]/g, ''))
-                ).length === 1 &&
-                targetColumns.length === 1;
+        function selectedExperiments() {
+            const selectedIds = new Set(
+                [...document.querySelectorAll('#experimentOptions input:checked')]
+                    .map(input => input.value)
+            );
+            return availableExperiments.filter(experiment => selectedIds.has(experiment.id));
+        }
+
+        function compatibleExperiments(first, candidate) {
+            return first.project_name === candidate.project_name &&
+                JSON.stringify(first.input_columns) === JSON.stringify(candidate.input_columns) &&
+                JSON.stringify(first.target_columns) === JSON.stringify(candidate.target_columns);
+        }
+
+        function updateExperimentOptionAvailability() {
+            const selected = selectedExperiments();
+            const reference = selected[0];
+            document.querySelectorAll('#experimentOptions input').forEach(input => {
+                const experiment = availableExperiments.find(item => item.id === input.value);
+                input.disabled = Boolean(
+                    reference && !input.checked &&
+                    !compatibleExperiments(reference, experiment)
+                );
+            });
         }
 
         function updateConditionRangeHint(input) {
@@ -286,7 +322,7 @@
         }
 
         async function loadExperiments() {
-            const select = document.getElementById('experimentSelect');
+            const options = document.getElementById('experimentOptions');
             const status = document.getElementById('experimentStatus');
 
             try {
@@ -296,45 +332,78 @@
                     throw new Error(result.error || '実験データを読み込めませんでした。');
                 }
 
-                select.replaceChildren();
-                if (result.experiments.length === 0) {
-                    select.add(new Option('実験データがありません', ''));
+                availableExperiments = result.experiments;
+                options.replaceChildren();
+                if (availableExperiments.length === 0) {
+                    options.textContent = '実験データがありません';
                     status.textContent = '先にデータ管理画面からCSVを登録してください。';
                     updateTrainingPointLimit();
                     return;
                 }
 
-                result.experiments.forEach(experiment => {
+                availableExperiments.forEach((experiment, index) => {
                     const label =
                         `${experiment.experiment_name} / ${experiment.project_name} / ` +
                         `${experiment.material_name} — ${experiment.domain} ` +
                         `(${experiment.point_count}行・${experiment.run_count}件)`;
-                    const option = new Option(label, experiment.id);
-                    option.dataset.pointCount = experiment.point_count;
-                    option.dataset.runCount = experiment.run_count;
-                    option.dataset.inputColumns = JSON.stringify(experiment.input_columns);
-                    option.dataset.targetColumns = JSON.stringify(experiment.target_columns);
-                    select.add(option);
+                    const wrapper = document.createElement('label');
+                    wrapper.className = 'experiment-option';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.value = experiment.id;
+                    checkbox.checked = index === 0;
+                    checkbox.addEventListener('change', () => {
+                        if (checkbox.checked) {
+                            const selected = selectedExperiments();
+                            const incompatible = selected.some(
+                                item => !compatibleExperiments(selected[0], item)
+                            );
+                            if (incompatible) checkbox.checked = false;
+                        }
+                        updateExperimentOptionAvailability();
+                        updateTrainingPointLimit();
+                    });
+                    const text = document.createElement('span');
+                    text.textContent = label;
+                    wrapper.append(checkbox, text);
+                    options.append(wrapper);
                 });
                 status.textContent = '';
+                updateExperimentOptionAvailability();
                 updateTrainingPointLimit();
             } catch (error) {
-                select.replaceChildren(new Option('実験データを読み込めません', ''));
+                availableExperiments = [];
+                options.textContent = '実験データを読み込めません';
                 status.textContent = error.message;
                 updateTrainingPointLimit();
             }
         }
 
+        function selectCompatibleDatasets() {
+            const boxes = [...document.querySelectorAll('#experimentOptions input')];
+            const selected = selectedExperiments();
+            const reference = selected[0] || availableExperiments[0];
+            if (!reference) return;
+            boxes.forEach(input => {
+                const experiment = availableExperiments.find(item => item.id === input.value);
+                input.checked = compatibleExperiments(reference, experiment);
+            });
+            updateExperimentOptionAvailability();
+            updateTrainingPointLimit();
+        }
+
         function updateTrainingPointLimit() {
-            const select = document.getElementById('experimentSelect');
-            const selected = select.selectedOptions[0];
+            const selected = selectedExperiments();
+            const reference = selected[0];
             const pointsInput = document.getElementById('trainingPoints');
             const help = document.getElementById('trainingPointsHelp');
             const button = document.getElementById('runPredictBtn');
-            const totalPoints = Number(selected?.dataset.pointCount || 0);
-            const inputColumns = JSON.parse(selected?.dataset.inputColumns || '[]');
-            const targetColumns = JSON.parse(selected?.dataset.targetColumns || '[]');
-            const modelSelect = document.getElementById('modelSelect');
+            const totalPoints = selected.reduce(
+                (sum, experiment) => sum + Number(experiment.point_count || 0),
+                0
+            );
+            const inputColumns = reference?.input_columns || [];
+            const targetColumns = reference?.target_columns || [];
             const conditionFields = document.getElementById('conditionFields');
             conditionFields.replaceChildren();
             document.getElementById('predictionResults').replaceChildren();
@@ -345,12 +414,6 @@
             activeModelType = null;
             trainingRanges = {};
             clearPredictionGraph();
-            modelSelect.querySelector('option[value="rc_parallel"]').disabled =
-                !supportsRcParallelModel(inputColumns, targetColumns);
-            if (modelSelect.value === 'rc_parallel' &&
-                !supportsRcParallelModel(inputColumns, targetColumns)) {
-                modelSelect.value = 'auto';
-            }
 
             inputColumns.forEach(column => {
                 const wrapper = document.createElement('div');
@@ -383,23 +446,30 @@
                 ? Math.min({{ default_training_points }}, trainingLimit)
                 : 5;
             help.textContent = totalPoints < 5
-                ? `現在${totalPoints}行です。同じ実験セット名でCSVを追加し、合計5行以上にしてください。`
+                ? `選択中の合計は${totalPoints}行です。学習には5行以上必要です。`
                 : totalPoints > {{ max_training_points }}
                     ? `全${totalPoints}行を登録済み。計算時は最大{{ max_training_points }}点を均等に抽出します。`
                     : `全${totalPoints}行から指定した点数を均等に抽出します。`;
+            document.getElementById('datasetSelectionHelp').textContent =
+                selected.length
+                    ? `${selected.length}件のデータセット / ${selected.reduce((sum, item) => sum + item.run_count, 0)}件のCSV / 合計${totalPoints}行を学習に使用します。`
+                    : '同じプロジェクト・列構成のデータセットを選択してください。';
             updateGraphControls(inputColumns, targetColumns, true);
             updatePredictButton();
         }
 
         function updatePredictButton() {
-            const select = document.getElementById('experimentSelect');
+            const selected = selectedExperiments();
             const pointsInput = document.getElementById('trainingPoints');
-            const totalPoints = Number(select.selectedOptions[0]?.dataset.pointCount || 0);
+            const totalPoints = selected.reduce(
+                (sum, experiment) => sum + Number(experiment.point_count || 0),
+                0
+            );
             const requestedPoints = Number(pointsInput.value);
             const trainingLimit = Math.min(totalPoints, {{ max_training_points }});
             const conditions = [...document.querySelectorAll('#conditionFields input')];
             document.getElementById('runPredictBtn').disabled =
-                !select.value ||
+                selected.length === 0 ||
                 totalPoints < 5 ||
                 !Number.isInteger(requestedPoints) ||
                 requestedPoints < 5 ||
@@ -453,11 +523,16 @@
             const isSurface = dimension.value === '2' && inputColumns.length > 1;
             document.getElementById('yAxisGroup').style.display = isSurface ? '' : 'none';
             document.getElementById('yRangeGroup').style.display = isSurface ? '' : 'none';
+            document.getElementById('compareModelsLabel').style.display = isSurface ? 'none' : 'block';
+            if (isSurface) document.getElementById('compareModels').checked = false;
+            const hasGprInterval =
+                activeModelType === 'gpr' ||
+                (!activeModelType && document.getElementById('modelSelect').value === 'gpr');
             const graphStyles = isSurface
                 ? [
-                    ['立体曲面（色で95%予測区間幅を表示）', 'surface'],
+                    ['立体曲面', 'surface'],
                     ['予測値の色分け図', 'heatmap'],
-                    ['95%予測区間幅の色分け図', 'uncertainty']
+                    ...(hasGprInterval ? [['GPR予測区間幅の色分け図', 'uncertainty']] : [])
                 ]
                 : [['折れ線', 'line'], ['棒グラフ', 'bar']];
             style.replaceChildren(...graphStyles.map(([label, value]) => new Option(label, value)));
@@ -480,7 +555,7 @@
         }
 
         async function runPrediction() {
-            const experiment_id = document.getElementById('experimentSelect').value;
+            const experiment_ids = selectedExperiments().map(experiment => experiment.id);
             const training_points = Number(document.getElementById('trainingPoints').value);
             const conditions = Object.fromEntries(
                 [...document.querySelectorAll('#conditionFields input')]
@@ -500,7 +575,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        experiment_id,
+                        experiment_ids,
                         training_points,
                         conditions,
                         model_type: document.getElementById('modelSelect').value
@@ -529,7 +604,7 @@
         function renderPredictionResults(data) {
             const container = document.getElementById('predictionResults');
             trainingRanges = data.training_ranges || {};
-            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            const selected = selectedExperiments()[0];
             [...document.querySelectorAll('#conditionFields input')].forEach(
                 updateConditionRangeHint
             );
@@ -547,16 +622,10 @@
                 `使用モデル: ${data.model_label}` +
                 (data.validation_available
                     ? ` / CSV単位の検証: ${data.validation_runs}分割で比較`
-                    : ' / 複数CSVがないため、CSV単位の精度検証はできていません');
-            modelSummary.textContent +=
-                ' / 予測区間はモデル推定と検証誤差を反映し、実測の保証ではありません';
-            if (data.model_parameters) {
-                const parameters = data.model_parameters;
-                modelSummary.textContent +=
-                    ` / 推定値: R=${Number(parameters.resistance_ohm).toPrecision(4)}Ω` +
-                    `、時定数=${Number(parameters.time_constant_s).toPrecision(4)}秒` +
-                    `、C=${Number(parameters.capacitance_f).toPrecision(4)}F`;
-            }
+                    : ' / CSV単位の精度検証はできていません') +
+                (data.prediction_interval
+                    ? ' / 帯はGPRの95%事後予測区間です（観測ノイズを含むガウス仮定）'
+                    : ' / このモデルは予測分布を算出しないため、予測区間は表示しません');
             const outOfRange = Object.entries(data.out_of_range_conditions || {});
             const warning = document.createElement('p');
             warning.style.cssText = 'color:#b45309; background:#fff7ed; padding:10px; border-radius:8px;';
@@ -565,7 +634,10 @@
                 : '表の範囲は、登録データの条件内で予測した結果です。';
             const table = document.createElement('table');
             const header = table.createTHead().insertRow();
-            ['結果', '予測値', '95%予測区間（下限）', '95%予測区間（上限）'].forEach(text => {
+            const predictionHeaders = data.prediction_interval
+                ? ['結果', '予測値', 'GPR予測区間（下限）', 'GPR予測区間（上限）']
+                : ['結果', '予測値'];
+            predictionHeaders.forEach(text => {
                 const cell = document.createElement('th');
                 cell.textContent = text;
                 header.append(cell);
@@ -574,19 +646,24 @@
             const body = table.createTBody();
             Object.entries(data.predictions).forEach(([name, value]) => {
                 const row = body.insertRow();
-                [
+                const values = [
                     name,
-                    Number(value).toPrecision(6),
-                    Number(data.confidence_low[name]).toPrecision(6),
-                    Number(data.confidence_high[name]).toPrecision(6)
-                ].forEach(text => {
+                    Number(value).toPrecision(6)
+                ];
+                if (data.prediction_interval) {
+                    values.push(
+                        Number(data.confidence_low[name]).toPrecision(6),
+                        Number(data.confidence_high[name]).toPrecision(6)
+                    );
+                }
+                values.forEach(text => {
                     const cell = row.insertCell();
                     cell.textContent = text;
                 });
             });
             const evaluation = document.createElement('table');
             const evaluationHeader = evaluation.createTHead().insertRow();
-            ['モデル', 'CSV単位の検証誤差（対象範囲で正規化）'].forEach(text => {
+            ['比較モデル', 'CSV単位の検証RMSE（対象範囲で正規化）'].forEach(text => {
                 const cell = document.createElement('th');
                 cell.textContent = text;
                 evaluationHeader.append(cell);
@@ -607,13 +684,35 @@
             );
         }
 
+        function modelComparisonTraces(data, target) {
+            return Object.entries(data.model_comparison_predictions || [])
+                .filter(([modelType]) => modelType !== data.model_type)
+                .map(([modelType, values]) => ({
+                    type: 'scatter',
+                    mode: 'lines',
+                    x: data.x_values,
+                    y: values[target],
+                    name: `${data.model_labels[modelType]}（比較）`,
+                    line: {
+                        dash: 'dash',
+                        width: 2,
+                        color: modelType === 'gpr' ? '#7c3aed' :
+                            modelType === 'polynomial' ? '#059669' : '#f97316'
+                    },
+                    hovertemplate:
+                        `${data.x_column}: %{x}<br>${target}: %{y}` +
+                        `<extra>${data.model_labels[modelType]}</extra>`
+                }));
+        }
+
         async function drawPredictionGraph() {
-            const select = document.getElementById('experimentSelect');
+            const experiment_ids = selectedExperiments().map(experiment => experiment.id);
             const conditions = Object.fromEntries(
                 [...document.querySelectorAll('#conditionFields input')]
                     .map(input => [input.dataset.column, Number(input.value)])
             );
             const dimension = document.getElementById('graphDimension').value;
+            const target = document.getElementById('targetSelect').value;
             const drawButton = document.getElementById('drawGraphBtn');
             drawButton.disabled = true;
             drawButton.textContent = 'グラフを作成しています...';
@@ -622,10 +721,13 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        experiment_id: select.value,
+                        experiment_ids,
                         training_points: Number(document.getElementById('trainingPoints').value),
                         conditions,
                         model_type: activeModelType || document.getElementById('modelSelect').value,
+                        target_column: target,
+                        compare_models: document.getElementById('compareModels').checked &&
+                            dimension === '1',
                         x_column: document.getElementById('xAxisSelect').value,
                         y_column: dimension === '2'
                             ? document.getElementById('yAxisSelect').value
@@ -640,16 +742,16 @@
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.error || 'グラフを作成できませんでした。');
 
-                const target = document.getElementById('targetSelect').value;
                 const style = document.getElementById('graphStyle').value;
                 const isSurface = data.y_values !== null;
                 const meanValues = data.predictions[target];
-                const lowValues = data.confidence_low[target];
-                const highValues = data.confidence_high[target];
-                const intervalWidths = highValues.map(
-                    (value, index) => value - lowValues[index]
-                );
-                const intervalCustomData = isSurface
+                const hasInterval = Boolean(data.prediction_interval);
+                const lowValues = hasInterval ? data.confidence_low[target] : null;
+                const highValues = hasInterval ? data.confidence_high[target] : null;
+                const intervalWidths = hasInterval
+                    ? highValues.map((value, index) => value - lowValues[index])
+                    : null;
+                const intervalCustomData = isSurface && hasInterval
                     ? meanValues.map((row, rowIndex) => row.map((_, columnIndex) => [
                         lowValues[rowIndex][columnIndex],
                         highValues[rowIndex][columnIndex]
@@ -662,15 +764,32 @@
                             x: data.x_values,
                             y: data.y_values,
                             z: meanValues,
-                            surfacecolor: intervalWidths,
-                            colorscale: 'Viridis',
-                            colorbar: { title: '95%予測区間幅' },
+                            surfacecolor: hasInterval ? intervalWidths : undefined,
+                            colorscale: 'Blues',
+                            colorbar: hasInterval ? { title: 'GPR予測区間幅' } : undefined,
                             customdata: intervalCustomData,
+                            hovertemplate: hasInterval
+                                ?
+                                `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                `<br>${target}: %{z}<br>GPR 95%区間: ` +
+                                `%{customdata[0]}～%{customdata[1]}<extra></extra>`
+                                : `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                    `<br>${target}: %{z}<extra></extra>`
+                    }];
+                    data.measured_data.forEach(series => {
+                        traces.push({
+                            type: 'scatter3d',
+                            mode: 'markers',
+                            x: series.x_values,
+                            y: series.y_values,
+                            z: series.target_values,
+                            name: `実測: ${series.label}`,
+                            marker: { size: 4, color: '#ef4444' },
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
-                                `<br>${target}: %{z}<br>95%区間: ` +
-                                `%{customdata[0]}～%{customdata[1]}<extra></extra>`
-                    }];
+                                `<br>${target}: %{z}<extra>${series.label}</extra>`
+                        });
+                    });
                 } else if (isSurface) {
                     const uncertaintyOnly = style === 'uncertainty';
                     traces = [{
@@ -679,41 +798,73 @@
                             y: data.y_values,
                             z: uncertaintyOnly ? intervalWidths : meanValues,
                             colorscale: 'Viridis',
-                            colorbar: { title: uncertaintyOnly ? '95%予測区間幅' : target },
+                            colorbar: { title: uncertaintyOnly ? 'GPR予測区間幅' : target },
                             customdata: intervalCustomData,
                             hovertemplate: uncertaintyOnly
                                 ? `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
-                                    `<br>95%予測区間幅: %{z}<br>上下限: ` +
+                                    `<br>GPR予測区間幅: %{z}<br>上下限: ` +
                                     `%{customdata[0]}～%{customdata[1]}<extra></extra>`
                                 : `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
-                                    `<br>${target}: %{z}<br>95%区間: ` +
-                                    `%{customdata[0]}～%{customdata[1]}<extra></extra>`
+                                    `<br>${target}: %{z}<extra></extra>`
                     }];
+                    data.measured_data.forEach(series => {
+                        traces.push({
+                            type: 'scatter',
+                            mode: 'markers',
+                            x: series.x_values,
+                            y: series.y_values,
+                            name: `実測: ${series.label}`,
+                            customdata: series.target_values,
+                            marker: { size: 8, color: '#ef4444' },
+                            hovertemplate:
+                                `${data.x_column}: %{x}<br>${data.y_column}: %{y}` +
+                                `<br>${target}: %{customdata}<extra>${series.label}</extra>`
+                        });
+                    });
                 } else if (style === 'bar') {
-                    traces = [{
+                    const barTrace = {
                         type: 'bar',
                         x: data.x_values,
                         y: meanValues,
                         name: target,
-                        customdata: lowValues.map((value, index) => [
-                            value,
-                            highValues[index]
-                        ]),
-                        hovertemplate:
+                        hovertemplate: `${data.x_column}: %{x}<br>${target}: %{y}<extra></extra>`
+                    };
+                    if (hasInterval) {
+                        barTrace.customdata = lowValues.map((value, index) => [
+                            value, highValues[index]
+                        ]);
+                        barTrace.hovertemplate =
                             `${data.x_column}: %{x}<br>${target}: %{y}` +
-                            `<br>95%予測区間: %{customdata[0]}～` +
-                            `%{customdata[1]}<extra></extra>`,
-                        error_y: {
+                            `<br>GPR 95%予測区間: %{customdata[0]}～` +
+                            `%{customdata[1]}<extra></extra>`;
+                        barTrace.error_y = {
                             type: 'data',
                             symmetric: false,
                             array: highValues.map((value, index) => value - meanValues[index]),
                             arrayminus: meanValues.map((value, index) => value - lowValues[index]),
                             visible: true
-                        }
-                    }];
+                        };
+                    }
+                    traces = [barTrace];
+                    data.measured_data.forEach(series => {
+                        traces.push({
+                            type: 'scatter',
+                            mode: 'markers',
+                            x: series.x_values,
+                            y: series.target_values,
+                            name: `実測: ${series.label}`,
+                            marker: { color: '#ef4444', size: 7 },
+                            hovertemplate:
+                                `${data.x_column}: %{x}<br>${target}: %{y}` +
+                                `<extra>${series.label}</extra>`
+                        });
+                    });
+                    traces.push(...modelComparisonTraces(data, target));
                 } else {
-                    traces = [
-                        {
+                    traces = [];
+                    if (hasInterval) {
+                        traces.push(
+                            {
                             type: 'scatter',
                             mode: 'lines',
                             x: data.x_values,
@@ -721,8 +872,8 @@
                             line: { width: 0 },
                             showlegend: false,
                             hoverinfo: 'skip'
-                        },
-                        {
+                            },
+                            {
                             type: 'scatter',
                             mode: 'lines',
                             x: data.x_values,
@@ -730,26 +881,42 @@
                             line: { width: 0 },
                             fill: 'tonexty',
                             fillcolor: 'rgba(59,130,246,0.2)',
-                            name: '95%予測区間',
+                            name: 'GPR 95%予測区間',
                             hoverinfo: 'skip'
-                        },
-                        {
+                            }
+                        );
+                    }
+                    traces.push({
                             type: 'scatter',
                             mode: 'lines',
                             x: data.x_values,
                             y: meanValues,
                             line: { color: '#2563eb', width: 3 },
                             name: target,
-                            customdata: lowValues.map((value, index) => [
-                                value,
-                                highValues[index]
-                            ]),
+                            customdata: hasInterval ? lowValues.map((value, index) => [
+                                value, highValues[index]
+                            ]) : undefined,
+                            hovertemplate: hasInterval
+                                ?
+                                `${data.x_column}: %{x}<br>${target}: %{y}` +
+                                `<br>GPR 95%予測区間: %{customdata[0]}～` +
+                                `%{customdata[1]}<extra></extra>`
+                                : `${data.x_column}: %{x}<br>${target}: %{y}<extra></extra>`
+                    });
+                    data.measured_data.forEach(series => {
+                        traces.push({
+                            type: 'scatter',
+                            mode: 'markers',
+                            x: series.x_values,
+                            y: series.target_values,
+                            name: `実測: ${series.label}`,
+                            marker: { color: '#ef4444', size: 7 },
                             hovertemplate:
                                 `${data.x_column}: %{x}<br>${target}: %{y}` +
-                                `<br>95%予測区間: %{customdata[0]}～` +
-                                `%{customdata[1]}<extra></extra>`
-                        }
-                    ];
+                                `<extra>${series.label}</extra>`
+                        });
+                    });
+                    traces.push(...modelComparisonTraces(data, target));
                 }
                 const axisDescription = isSurface
                     ? `${data.x_column} × ${data.y_column}`
@@ -758,7 +925,9 @@
                     .map(([name, value]) => `${name}=${value}`)
                     .join('、');
                 const layout = {
-                    title: `${target} の予測と95%予測区間（${axisDescription}）`,
+                    title: hasInterval
+                        ? `${target} のGPR予測と95%事後予測区間（${axisDescription}）`
+                        : `${target} の予測と実測データ（${axisDescription}）`,
                     autosize: true,
                     margin: { l: 60, r: 30, t: 60, b: 60 },
                     xaxis: { title: data.x_column },
@@ -795,13 +964,14 @@
                 graphWarning.style.display = outOfRange.length ? 'block' : 'none';
                 graphWarning.textContent = outOfRange.length
                     ? `学習データの範囲外です（${warningDetails.join('、')}）。` +
-                        '外挿の予測は不確かで、表示された予測区間も正しさを保証しません。'
+                        '外挿の予測は不確かで、表示される区間も正しさを保証しません。'
                     : '';
                 document.getElementById('graphHelp').textContent =
-                    `全${data.total_points}行から${data.training_points}点で予測` +
+                    `選択した${data.experiment_ids.length}件 / ${data.total_points}行から` +
+                    `${data.training_points}点で予測・実測点を重ねて表示` +
                     (fixedDescription ? ` / 固定条件: ${fixedDescription}` : '') +
                     (outOfRange.length
-                        ? ` / 注意: ${[...new Set(outOfRange)].join('、')}は学習範囲外です。95%予測区間を参考にしてください。`
+                        ? ` / 注意: ${[...new Set(outOfRange)].join('、')}は学習範囲外です。`
                         : '');
             } catch (error) {
                 document.getElementById('graphHelp').textContent = error.message;
@@ -821,12 +991,20 @@
             return [Number(minValue), Number(maxValue)];
         }
 
-        document.getElementById('experimentSelect').addEventListener('change', updateTrainingPointLimit);
+        document.getElementById('selectCompatibleDatasets').addEventListener(
+            'click',
+            selectCompatibleDatasets
+        );
         document.getElementById('modelSelect').addEventListener('change', () => {
             document.getElementById('predictionResults').replaceChildren();
             predictionAvailable = false;
             activeModelType = null;
             clearPredictionGraph();
+            const selected = selectedExperiments()[0];
+            updateGraphControls(
+                selected?.input_columns || [],
+                selected?.target_columns || []
+            );
             document.getElementById('graphHelp').textContent =
                 '予測モデルを変更しました。再度予測してください。';
             updatePredictButton();
@@ -840,31 +1018,31 @@
             updatePredictButton();
         });
         document.getElementById('graphDimension').addEventListener('change', () => {
-            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            const selected = selectedExperiments()[0];
             updateGraphControls(
-                JSON.parse(selected?.dataset.inputColumns || '[]'),
-                JSON.parse(selected?.dataset.targetColumns || '[]')
+                selected?.input_columns || [],
+                selected?.target_columns || []
             );
         });
         document.getElementById('xAxisSelect').addEventListener('change', () => {
             document.getElementById('xRangeMin').value = '';
             document.getElementById('xRangeMax').value = '';
-            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            const selected = selectedExperiments()[0];
             updateGraphControls(
-                JSON.parse(selected?.dataset.inputColumns || '[]'),
-                JSON.parse(selected?.dataset.targetColumns || '[]')
+                selected?.input_columns || [],
+                selected?.target_columns || []
             );
         });
         document.getElementById('yAxisSelect').addEventListener('change', () => {
             document.getElementById('yRangeMin').value = '';
             document.getElementById('yRangeMax').value = '';
-            const selected = document.getElementById('experimentSelect').selectedOptions[0];
+            const selected = selectedExperiments()[0];
             updateGraphControls(
-                JSON.parse(selected?.dataset.inputColumns || '[]'),
-                JSON.parse(selected?.dataset.targetColumns || '[]')
+                selected?.input_columns || [],
+                selected?.target_columns || []
             );
         });
-        ['targetSelect', 'graphStyle'].forEach(id => {
+        ['targetSelect', 'graphStyle', 'compareModels'].forEach(id => {
             document.getElementById(id).addEventListener('change', () => {
                 if (!predictionAvailable) return;
                 clearPredictionGraph();

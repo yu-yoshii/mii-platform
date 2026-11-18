@@ -358,6 +358,14 @@
         <div class="modal-content">
             <button class="modal-close" onclick="closeModal()">×</button>
             <h3 id="modalTitle" style="margin-bottom:15px; color:#2980b9;">実験データグラフ確認</h3>
+            <div style="display:flex; gap:12px; margin-bottom:12px;">
+                <label style="flex:1;">横軸
+                    <select id="dataGraphX"></select>
+                </label>
+                <label style="flex:1;">縦軸
+                    <select id="dataGraphY"></select>
+                </label>
+            </div>
             <div style="width: 100%; height: 350px;">
                 <canvas id="spectrumChart"></canvas>
             </div>
@@ -370,6 +378,7 @@
         let currentProject = 'すべて';
         let isNewest = false;
         let myChart = null; 
+        let currentGraphData = null;
         const previousColumnRoles = new Map();
 
         socket.on('connect', () => {
@@ -534,9 +543,14 @@
         socket.on('load all messages', function(messages) {
             allData = messages.map(msg => {
                 return {
-                    _id: msg.id, 
+                    _id: msg.run_id ? `${msg.id}::${msg.run_id}` : msg.id,
+                    _group_id: msg.id,
+                    _run_id: msg.run_id || null,
                     project_name: msg.project_name,
                     material_name: msg.material_name,
+                    experiment_name: msg.experiment_name,
+                    csv_filename: msg.csv_filename,
+                    group_row_count: msg.group_row_count,
                     message: msg.message,
                     h_val: msg.h_val,
                     s_val: msg.s_val,
@@ -558,9 +572,14 @@
 
         socket.on('load one message', (msg) => { 
             allData.unshift({
-                _id: msg.id, 
+                _id: msg.run_id ? `${msg.id}::${msg.run_id}` : msg.id,
+                _group_id: msg.id,
+                _run_id: msg.run_id || null,
                 project_name: msg.project_name,
                 material_name: msg.material_name,
+                experiment_name: msg.experiment_name,
+                csv_filename: msg.csv_filename,
+                group_row_count: msg.group_row_count,
                 message: msg.message,
                 h_val: msg.h_val,
                 s_val: msg.s_val,
@@ -580,40 +599,95 @@
         });
 
         socket.on('message deleted', (data) => {
-            allData = allData.filter(d => d._id !== data.id);
+            allData = allData.filter(d => {
+                if (data.run_id) {
+                    return !(d._group_id === data.id && d._run_id === data.run_id);
+                }
+                return d._group_id !== data.id && d._id !== data.id;
+            });
+            if (data.run_id) {
+                allData.forEach(item => {
+                    if (item._group_id === data.id) {
+                        item.group_row_count = data.group_row_count;
+                    }
+                });
+            }
             updateUI();
         });
 
-        function deleteMsg(id, event) {
+        function deleteMsg(id, event, runId = null) {
             if (event) event.stopPropagation();
-            if (confirm("このデータを完全に削除してもよろしいですか？")) {
-                socket.emit('delete message', { id: id });
+            if (confirm(runId
+                ? "このCSVだけを削除してもよろしいですか？"
+                : "このデータを完全に削除してもよろしいですか？")) {
+                socket.emit('delete message', { id: id, run_id: runId });
             }
         }
 
-        function openGraph(id) {
-            const target = allData.find(d => d._id === id);
-            if (!target || !target.x_values || target.x_values.length === 0) {
-                return; 
+        async function openGraph(id, runId = null) {
+            const target = allData.find(d =>
+                d._group_id === id && d._run_id === runId
+            );
+            if (!target) return;
+            let graphData;
+            if (runId) {
+                const response = await fetch(
+                    `/api/experiments/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`
+                );
+                graphData = await response.json();
+                if (!response.ok) return alert(graphData.error || 'CSVを読み込めませんでした。');
+            } else if (target.x_values?.length) {
+                graphData = {
+                    input_columns: [target.x_label],
+                    target_columns: [target.y_label],
+                    input_values: target.x_values.map(value => [value]),
+                    target_values: target.y_values.map(value => [value]),
+                    filename: target.material_name
+                };
+            } else {
+                return;
             }
-            document.getElementById('modalTitle').innerText = `データプロット: ${target.material_name} (${target.project_name})`;
+            currentGraphData = graphData;
+            document.getElementById('modalTitle').innerText =
+                `データプロット: ${graphData.filename || target.csv_filename || target.material_name}`;
+            const xSelect = document.getElementById('dataGraphX');
+            const ySelect = document.getElementById('dataGraphY');
+            xSelect.replaceChildren(...graphData.input_columns.map(
+                column => new Option(column, column)
+            ));
+            ySelect.replaceChildren(...graphData.target_columns.map(
+                column => new Option(column, column)
+            ));
+            xSelect.onchange = drawDataGraph;
+            ySelect.onchange = drawDataGraph;
             document.getElementById('graphModal').classList.add('active');
+            drawDataGraph();
+        }
 
+        function drawDataGraph() {
+            if (!currentGraphData) return;
+            const xIndex = currentGraphData.input_columns.indexOf(
+                document.getElementById('dataGraphX').value
+            );
+            const yIndex = currentGraphData.target_columns.indexOf(
+                document.getElementById('dataGraphY').value
+            );
             const ctx = document.getElementById('spectrumChart').getContext('2d');
             if (myChart) { myChart.destroy(); }
-
             myChart = new Chart(ctx, {
-                type: 'line',
+                type: 'scatter',
                 data: {
-                    labels: target.x_values, //  X軸の値
                     datasets: [{
-                        label: `${target.y_label} vs ${target.x_label}`, // 💡 動的な凡例
-                        data: target.y_values, //  Y軸の値
-                        borderColor: '#8e44ad', 
+                        label: `${currentGraphData.target_columns[yIndex]} vs ${currentGraphData.input_columns[xIndex]}`,
+                        data: currentGraphData.input_values.map((row, index) => ({
+                            x: row[xIndex],
+                            y: currentGraphData.target_values[index][yIndex]
+                        })).sort((left, right) => left.x - right.x),
+                        showLine: true,
+                        borderColor: '#8e44ad',
                         backgroundColor: 'rgba(142, 68, 173, 0.05)',
                         borderWidth: 2,
-                        pointRadius: target.x_values.length > 300 ? 0 : 2, // データ数が多すぎるときは線を滑らかに、少なければ点を打つ
-                        fill: true,
+                        pointRadius: currentGraphData.row_count > 300 ? 0 : 2,
                         tension: 0.1
                     }]
                 },
@@ -621,8 +695,8 @@
                     responsive: true,
                     maintainAspectRatio: false,
                     scales: {
-                        x: { title: { display: true, text: target.x_label } }, // 💡 X軸のラベルを自動変更
-                        y: { title: { display: true, text: target.y_label } }  // 💡 Y軸のラベルを自動変更
+                        x: { type: 'linear', title: { display: true, text: currentGraphData.input_columns[xIndex] } },
+                        y: { title: { display: true, text: currentGraphData.target_columns[yIndex] } }
                     }
                 }
             });
@@ -658,12 +732,14 @@
 
             display.innerHTML = filteredData.map(msg => {
                 const id = escapeHtml(msg._id);
+                const groupId = escapeHtml(msg._group_id || msg._id);
+                const runId = msg._run_id ? escapeHtml(msg._run_id) : '';
                 const projectName = escapeHtml(msg.project_name || '未分類');
                 const materialName = escapeHtml(msg.material_name || '名称不明');
                 if (msg.image_data) {
                     return `
                         <div class="card message-card" id="msg-${id}">
-                            <button class="delete-btn" onclick="deleteMsg('${id}', event)">×</button>
+                            <button class="delete-btn" onclick="deleteMsg('${groupId}', event)">×</button>
                             <img src="${escapeHtml(msg.image_data)}" alt="Material Image">
                             <div>
                                 <div class="badge-wrapper">
@@ -682,14 +758,15 @@
                     const inputColumns = (msg.input_columns || []).map(escapeHtml).join(', ');
                     const targetColumns = (msg.target_columns || []).map(escapeHtml).join(', ');
                     const description = msg.input_columns?.length
-                        ? `${inputColumns} → ${targetColumns} (${dataCount} 行)`
+                        ? `${inputColumns} → ${targetColumns} (${dataCount} 行` +
+                            (msg.group_row_count ? ` / 学習セット合計 ${msg.group_row_count} 行)` : ')')
                         : `${escapeHtml(msg.x_label)} - ${escapeHtml(msg.y_label)} (${dataCount} 点)`;
-                    const graphHandler = msg.x_values?.length
-                        ? `onclick="openGraph('${id}')"`
+                    const graphHandler = msg._run_id || msg.x_values?.length
+                        ? `onclick="openGraph('${groupId}'${runId ? `, '${runId}'` : ''})"`
                         : '';
                     return `
-                        <div class="card message-card ${msg.x_values?.length ? 'csv-card' : ''}" id="msg-${id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" ${graphHandler}>
-                            <button class="delete-btn" onclick="deleteMsg('${id}', event)">×</button>
+                        <div class="card message-card ${msg._run_id || msg.x_values?.length ? 'csv-card' : ''}" id="msg-${id}" style="border-left: 6px solid #8e44ad; background-color: #f5f3ff;" ${graphHandler}>
+                            <button class="delete-btn" onclick="deleteMsg('${groupId}', event${runId ? `, '${runId}'` : ''})">×</button>
                             <div style="width: 100px; height: 75px; background: #8e44ad; color: white; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-weight: bold; font-size: 0.75em; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); line-height: 1.3;">
                                 DATA<br>PLOTTER
                             </div>
@@ -699,7 +776,7 @@
                                     <span class="badge" style="background:#f3e8ff; color:#6b21a8;">${materialName}</span>
                                 </div>
                                 <p style="margin:5px 0; font-weight:bold; color:#8e44ad; font-size:0.95em;">
-                                     ${escapeHtml(msg.domain || '実験')} データ: <span style="color:var(--text-main); font-weight:500;">${description}</span>
+                                     ${escapeHtml(msg.experiment_name || msg.domain || '実験')} / ${escapeHtml(msg.csv_filename || '')}: <span style="color:var(--text-main); font-weight:500;">${description}</span>
                                 </p>
                                 <p style="margin:0; font-size:0.8em; color:#8b5cf6;"> 条件と結果のデータを保存しました</p>
                             </div>

@@ -36,9 +36,9 @@ from openpyxl.chart import ScatterChart, Series, Reference
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.preprocessing import StandardScaler
-from scipy.optimize import least_squares
 # 機械学習の機能、ガウス過程回帰を読み出している
 
 app = Flask(__name__)
@@ -50,9 +50,9 @@ MAX_VALIDATION_POINTS = 300
 MIN_EXPERIMENT_POINTS = 5
 
 MODEL_LABELS = {
-    "gpr": "汎用ガウス過程（補間向け）",
+    "gpr": "ガウス過程回帰（主モデル）",
     "polynomial": "2次多項式回帰",
-    "rc_parallel": "並列RC回路モデル"
+    "random_forest": "ランダムフォレスト回帰"
 }
 
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20000000)
@@ -223,100 +223,6 @@ def resolve_axis_range(requested_range, axis_values):
         raise ValueError("グラフ範囲の最小値は最大値より小さくしてください。")
     return low, high
 
-def find_rc_columns(input_columns, target_columns):
-    def normalized(column):
-        return "".join(character for character in column.lower() if character.isalnum())
-
-    current_columns = [
-        index for index, column in enumerate(input_columns)
-        if "current" in normalized(column)
-        or "ampere" in normalized(column)
-        or "電流" in normalized(column)
-        or normalized(column).startswith("amps")
-        or normalized(column) in {"amp", "ia", "iamp"}
-    ]
-    time_columns = [
-        index for index, column in enumerate(input_columns)
-        if any(token in normalized(column) for token in ("time", "elapsed", "時間"))
-        or normalized(column) in {"t", "ts", "tsec", "秒"}
-    ]
-    voltage_columns = [
-        index for index, column in enumerate(target_columns)
-        if any(token in normalized(column) for token in ("voltage", "volt", "電圧"))
-        or normalized(column) in {"v", "vc", "vout"}
-    ]
-    if (
-        len(current_columns) != 1
-        or len(time_columns) != 1
-        or len(voltage_columns) != 1
-        or len(target_columns) != 1
-    ):
-        return None
-    return current_columns[0], time_columns[0], voltage_columns[0]
-
-
-def fit_rc_parallel_model(input_values, target_values, input_columns, target_columns):
-    indices = find_rc_columns(input_columns, target_columns)
-    if indices is None:
-        raise ValueError(
-            "RC回路モデルには、条件列の電流・時間と結果列の電圧を識別できる列名が必要です。"
-        )
-    if target_values.shape[1] != 1 or len(input_values) < 5:
-        raise ValueError("RC回路モデルは電圧1列、測定データ5行以上で使用できます。")
-
-    current_index, time_index, voltage_index = indices
-    current = input_values[:, current_index]
-    time = input_values[:, time_index]
-    voltage = target_values[:, voltage_index]
-    if np.any(time < 0) or len(np.unique(time)) < 3 or np.allclose(current, 0):
-        raise ValueError("RC回路モデルには、0以上の時間と変化のある電流データが必要です。")
-
-    initial_offset = float(voltage[np.argmin(time)])
-    current_scale = max(float(np.max(np.abs(current))), 1e-9)
-    resistance_guess = max(
-        float(np.ptp(voltage)) / current_scale,
-        1e-6
-    )
-    time_constant_guess = max(float(np.ptp(time)) / 3, 1e-3)
-
-    def calculate(parameters, current_values, time_values):
-        resistance, time_constant = np.exp(parameters[:2])
-        offset = parameters[2]
-        return offset + current_values * resistance * (
-            -np.expm1(-time_values / time_constant)
-        )
-
-    fit = least_squares(
-        lambda parameters: calculate(parameters, current, time) - voltage,
-        x0=[
-            np.log(resistance_guess),
-            np.log(time_constant_guess),
-            initial_offset
-        ],
-        bounds=([-30, -30, -np.inf], [30, 30, np.inf]),
-        max_nfev=5000
-    )
-    if not fit.success or not np.all(np.isfinite(fit.x)):
-        raise ValueError("RC回路の抵抗と時定数をデータから推定できませんでした。")
-
-    residuals = calculate(fit.x, current, time) - voltage
-    degrees_of_freedom = max(len(voltage) - len(fit.x), 1)
-    residual_variance = float(np.dot(residuals, residuals) / degrees_of_freedom)
-    covariance = residual_variance * np.linalg.pinv(fit.jac.T @ fit.jac)
-    resistance, time_constant = np.exp(fit.x[:2])
-    return {
-        "type": "rc_parallel",
-        "current_index": current_index,
-        "time_index": time_index,
-        "voltage_index": voltage_index,
-        "resistance": float(resistance),
-        "time_constant": float(time_constant),
-        "offset": float(fit.x[2]),
-        "covariance": covariance,
-        "residual_variance": residual_variance
-    }
-
-
 def fit_experiment_candidate(
     model_type,
     input_values,
@@ -325,11 +231,6 @@ def fit_experiment_candidate(
     target_columns,
     optimize_gpr=True
 ):
-    if model_type == "rc_parallel":
-        return fit_rc_parallel_model(
-            input_values, target_values, input_columns, target_columns
-        )
-
     scaler = StandardScaler()
     scaled_values = scaler.fit_transform(input_values)
     if model_type == "gpr":
@@ -357,49 +258,32 @@ def fit_experiment_candidate(
         scaled_targets = target_scaler.fit_transform(target_values)
         estimator = Ridge(alpha=1.0)
         estimator.fit(features, scaled_targets)
-        residuals = target_values - target_scaler.inverse_transform(
-            np.asarray(estimator.predict(features)).reshape(len(features), -1)
-        )
-        residual_std = np.sqrt(np.mean(np.square(residuals), axis=0))
         return {
             "type": model_type,
             "scaler": scaler,
             "polynomial": polynomial,
             "target_scaler": target_scaler,
-            "estimator": estimator,
-            "residual_std": residual_std
+            "estimator": estimator
+        }
+    if model_type == "random_forest":
+        estimator = RandomForestRegressor(
+            n_estimators=200,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=1
+        )
+        forest_targets = target_values[:, 0] if target_values.shape[1] == 1 else target_values
+        estimator.fit(scaled_values, forest_targets)
+        return {
+            "type": model_type,
+            "scaler": scaler,
+            "estimator": estimator
         }
     raise ValueError("指定した予測モデルは利用できません。")
 
 
 def predict_experiment_candidate(model, input_values):
     model_type = model["type"]
-    if model_type == "rc_parallel":
-        current = input_values[:, model["current_index"]]
-        time = input_values[:, model["time_index"]]
-        resistance = model["resistance"]
-        time_constant = model["time_constant"]
-        decay = np.exp(-time / time_constant)
-        amplitude = current * resistance
-        response = amplitude * (1 - decay)
-        mean = (model["offset"] + response).reshape(-1, 1)
-        gradient = np.column_stack((
-            response,
-            -amplitude * decay * time / time_constant,
-            np.ones(len(time))
-        ))
-        parameter_variance = np.einsum(
-            "ij,jk,ik->i",
-            gradient,
-            model["covariance"],
-            gradient
-        )
-        std = np.sqrt(np.maximum(
-            parameter_variance + model["residual_variance"],
-            0
-        )).reshape(-1, 1)
-        return mean, std
-
     scaled_values = model["scaler"].transform(input_values)
     if model_type == "gpr":
         mean, std = model["estimator"].predict(scaled_values, return_std=True)
@@ -409,14 +293,146 @@ def predict_experiment_candidate(model, input_values):
             mean = mean.reshape(-1, 1)
             std = std.reshape(-1, 1)
         return mean, std
+    if model_type == "random_forest":
+        mean = np.asarray(model["estimator"].predict(scaled_values))
+        if mean.ndim == 1:
+            mean = mean.reshape(-1, 1)
+        return mean, None
 
     features = model["polynomial"].transform(scaled_values)
     scaled_mean = model["estimator"].predict(features)
     mean = model["target_scaler"].inverse_transform(
         np.asarray(scaled_mean).reshape(len(input_values), -1)
     )
-    std = np.tile(model["residual_std"], (len(input_values), 1))
-    return mean, std
+    return mean, None
+
+
+def experiment_run_key(run, index):
+    source_key = run.get("source_key")
+    if source_key is not None:
+        return str(source_key)
+    if run.get("csv_file_id") is not None:
+        return str(run["csv_file_id"])
+    if run.get("run_id") is not None:
+        return str(run["run_id"])
+    return str(index)
+
+
+def load_experiment_runs(spec):
+    input_columns = spec.get("input_columns")
+    target_columns = spec.get("target_columns")
+    runs = spec.get("runs", [])
+    if input_columns and target_columns and runs:
+        loaded_runs = []
+        for index, run in enumerate(runs):
+            if "input_values" in run and "target_values" in run:
+                input_values = np.asarray(run["input_values"], dtype=float)
+                target_values = np.asarray(run["target_values"], dtype=float)
+            else:
+                csv_bytes = fs.get(run["csv_file_id"]).read()
+                headers, rows = parse_csv_table(csv_bytes)
+                input_values, target_values = parse_numeric_columns(
+                    headers, rows, input_columns, target_columns, minimum_rows=1
+                )
+            loaded_runs.append({
+                "input_values": input_values,
+                "target_values": target_values,
+                "row_count": len(input_values),
+                "source_key": experiment_run_key(run, index),
+                "label": run.get("label", run.get("csv_filename", f"CSV {index + 1}"))
+            })
+        return loaded_runs
+
+    input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
+    return [{
+        "input_values": input_values,
+        "target_values": target_values,
+        "row_count": len(input_values),
+        "source_key": str(spec["_id"]),
+        "label": spec.get("experiment_name", spec.get("material_name", "実験データ"))
+    }]
+
+
+def build_training_experiment(experiment_ids):
+    specs = []
+    for experiment_id in experiment_ids:
+        if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
+            raise ValueError("学習対象のデータを選び直してください。")
+        spec = find_experiment(ObjectId(experiment_id))
+        if spec is None:
+            raise ValueError("選択したデータが見つかりません。")
+        specs.append(spec)
+    if not specs:
+        raise ValueError("学習対象のデータを1つ以上選択してください。")
+
+    first = specs[0]
+    input_columns = first.get("input_columns")
+    target_columns = first.get("target_columns")
+    if not input_columns or not target_columns:
+        input_columns, target_columns, _, _ = load_experiment_table(first)
+    project_name = first.get("project_name", "未分類")
+    combined_runs = []
+    for spec in specs:
+        columns = spec.get("input_columns"), spec.get("target_columns")
+        if not all(columns):
+            source_inputs, source_targets, _, _ = load_experiment_table(spec)
+            columns = source_inputs, source_targets
+        if columns != (input_columns, target_columns):
+            raise ValueError("まとめて学習するデータは条件列と結果列の構成をそろえてください。")
+        if len(specs) > 1 and spec.get("project_name", "未分類") != project_name:
+            raise ValueError("まとめて学習するデータは同じプロジェクトから選択してください。")
+
+        source_id = str(spec["_id"])
+        source_name = spec.get("experiment_name", spec.get("material_name", "実験データ"))
+        if spec.get("runs"):
+            for index, run in enumerate(spec["runs"]):
+                combined_run = dict(run)
+                combined_run["source_key"] = f"{source_id}:{experiment_run_key(run, index)}"
+                combined_run["label"] = (
+                    f"{source_name} / {run.get('csv_filename', f'CSV {index + 1}')}"
+                )
+                combined_runs.append(combined_run)
+        else:
+            loaded_run = load_experiment_runs(spec)[0]
+            combined_runs.append({
+                "input_values": loaded_run["input_values"],
+                "target_values": loaded_run["target_values"],
+                "row_count": loaded_run["row_count"],
+                "source_key": f"{source_id}:{loaded_run['source_key']}",
+                "label": source_name
+            })
+
+    return {
+        "_id": ":".join(str(spec["_id"]) for spec in specs),
+        "source_ids": [str(spec["_id"]) for spec in specs],
+        "project_name": project_name,
+        "experiment_name": "、".join(
+            spec.get("experiment_name", spec.get("material_name", "実験データ"))
+            for spec in specs
+        ),
+        "input_columns": input_columns,
+        "target_columns": target_columns,
+        "runs": combined_runs,
+        "row_count": sum(run.get("row_count", 0) for run in combined_runs),
+        "run_count": len(combined_runs)
+    }
+
+
+def request_experiment_ids(req_data):
+    experiment_ids = req_data.get("experiment_ids")
+    if experiment_ids is None:
+        experiment_ids = [req_data.get("experiment_id")]
+    if (
+        not isinstance(experiment_ids, list)
+        or not experiment_ids
+        or len(experiment_ids) > 50
+        or any(not isinstance(value, str) or not ObjectId.is_valid(value)
+               for value in experiment_ids)
+    ):
+        raise ValueError("学習対象のデータを1〜50件選択してください。")
+    if len(set(experiment_ids)) != len(experiment_ids):
+        raise ValueError("同じデータを重複して選択できません。")
+    return experiment_ids
 
 
 def get_run_slices(spec, row_count):
@@ -458,7 +474,8 @@ def validate_experiment_models(
         }
 
     source_files = tuple(
-        str(run["csv_file_id"]) for run in spec.get("runs", [])
+        experiment_run_key(run, index)
+        for index, run in enumerate(spec.get("runs", []))
     )
     cache_key = (
         str(spec["_id"]),
@@ -470,9 +487,7 @@ def validate_experiment_models(
     if model_validation_cache["cache_key"] == cache_key:
         return model_validation_cache["result"]
 
-    candidate_types = ["gpr", "polynomial"]
-    if find_rc_columns(input_columns, target_columns) is not None:
-        candidate_types.append("rc_parallel")
+    candidate_types = ["gpr", "polynomial", "random_forest"]
 
     candidates = []
     target_scales = np.ptp(target_values, axis=0)
@@ -582,7 +597,8 @@ def get_experiment_model(
     model_type="gpr"
 ):
     source_files = tuple(
-        str(run["csv_file_id"]) for run in spec.get("runs", [])
+        experiment_run_key(run, index)
+        for index, run in enumerate(spec.get("runs", []))
     ) or (str(spec.get("csv_file_id", "legacy")),)
     cache_key = (
         str(spec["_id"]),
@@ -640,12 +656,6 @@ def prepare_experiment_model(
     else:
         model_type = requested_model
         selection_reason = "user_selected"
-    if model_type == "rc_parallel" and find_rc_columns(
-        input_columns, target_columns
-    ) is None:
-        raise ValueError(
-            "RC回路モデルには、条件列の電流・時間と結果列の電圧を識別できる列名が必要です。"
-        )
 
     _, model = get_experiment_model(
         spec,
@@ -659,19 +669,18 @@ def prepare_experiment_model(
     return model_type, selection_reason, model, validation
 
 
-def include_validation_uncertainty(std_values, validation, model_type, target_columns):
-    residual_q95 = validation.get("residual_q95", {}).get(model_type)
-    if not residual_q95:
-        return std_values
-    calibration = np.asarray(
-        [residual_q95[column] for column in target_columns],
-        dtype=float
-    ) / 1.96
-    calibration = calibration.reshape((1,) * (std_values.ndim - 1) + (-1,))
-    return np.maximum(std_values, calibration)
+def gaussian_prediction_interval(mean_values, std_values):
+    if std_values is None:
+        return None
+    return {
+        "level": 0.95,
+        "method": "gaussian_process_posterior_predictive",
+        "lower": np.asarray(mean_values) - 1.96 * np.asarray(std_values),
+        "upper": np.asarray(mean_values) + 1.96 * np.asarray(std_values)
+    }
 
 
-def prediction_model_metadata(model_type, selection_reason, validation, model):
+def prediction_model_metadata(model_type, selection_reason, validation):
     metadata = {
         "model_type": model_type,
         "model_label": MODEL_LABELS[model_type],
@@ -680,12 +689,6 @@ def prediction_model_metadata(model_type, selection_reason, validation, model):
         "validation_runs": validation["fold_count"],
         "model_evaluation": validation["candidates"]
     }
-    if model_type == "rc_parallel":
-        metadata["model_parameters"] = {
-            "resistance_ohm": model["resistance"],
-            "time_constant_s": model["time_constant"],
-            "capacitance_f": model["time_constant"] / model["resistance"]
-        }
     return metadata
 
 
@@ -693,7 +696,8 @@ def load_experiment_table(spec):
     input_columns = spec.get("input_columns")
     target_columns = spec.get("target_columns")
     source_files = tuple(
-        str(run["csv_file_id"]) for run in spec.get("runs", [])
+        experiment_run_key(run, index)
+        for index, run in enumerate(spec.get("runs", []))
     ) or (str(spec.get("csv_file_id", "legacy")),)
     cache_key = (
         str(spec["_id"]),
@@ -707,18 +711,13 @@ def load_experiment_table(spec):
         return experiment_table_cache["table"]
 
     if input_columns and target_columns and spec.get("runs"):
-        input_tables = []
-        target_tables = []
-        for run in spec["runs"]:
-            csv_bytes = fs.get(run["csv_file_id"]).read()
-            headers, rows = parse_csv_table(csv_bytes)
-            input_values, target_values = parse_numeric_columns(
-                headers, rows, input_columns, target_columns, minimum_rows=1
-            )
-            input_tables.append(input_values)
-            target_tables.append(target_values)
-        input_values = np.concatenate(input_tables, axis=0)
-        target_values = np.concatenate(target_tables, axis=0)
+        loaded_runs = load_experiment_runs(spec)
+        input_values = np.concatenate(
+            [run["input_values"] for run in loaded_runs], axis=0
+        )
+        target_values = np.concatenate(
+            [run["target_values"] for run in loaded_runs], axis=0
+        )
         table = (input_columns, target_columns, input_values, target_values)
     elif input_columns and target_columns and spec.get("csv_file_id"):
         csv_bytes = fs.get(spec["csv_file_id"]).read()
@@ -796,6 +795,8 @@ def load_messages():
                 x_lbl = ", ".join(input_columns)
                 y_lbl = ", ".join(target_columns)
                 data_points = spec.get("row_count", 0)
+                run_id = str(spec["_id"]) if spec.get("csv_file_id") else None
+                csv_filename = spec.get("csv_filename", "CSV")
                 message = (
                     f"【{spec.get('domain', '実験データ')}】{data_points} 行"
                     f" / 条件: {x_lbl} / 結果: {y_lbl}"
@@ -806,9 +807,11 @@ def load_messages():
                 x_lbl = spec.get('x_label', 'Wavelength (nm)')
                 y_lbl = spec.get('y_label', 'Intensity')
                 data_points = len(x_vals)
+                run_id = None
+                csv_filename = None
                 message = f"【実験データ】{data_points} 点の {x_lbl} / {y_lbl} データを保持"
 
-            combined_timeline.append({
+            timeline_item = {
                 'id': str(spec['_id']),
                 'date': spec.get('date', datetime.now()),
                 'project_name': spec.get('project_name', '未分類'),
@@ -827,41 +830,54 @@ def load_messages():
                 'y_values': y_vals,
                 'wavelengths': x_vals,
                 'intensities': y_vals
-            })
+            }
+            if run_id:
+                timeline_item.update({
+                    "run_id": run_id,
+                    "csv_filename": csv_filename,
+                    "group_row_count": data_points
+                })
+            combined_timeline.append(timeline_item)
 
         groups = getattr(db, "experiment_groups", None)
         if groups is not None:
             for group in groups.find().sort("date", -1).limit(50):
                 input_columns = group.get("input_columns", [])
                 target_columns = group.get("target_columns", [])
-                row_count = group.get("row_count", 0)
-                run_count = group.get("run_count", len(group.get("runs", [])))
-                combined_timeline.append({
-                    "id": str(group["_id"]),
-                    "date": group.get("date", datetime.now()),
-                    "project_name": group.get("project_name", "未分類"),
-                    "material_name": group.get("material_name", "名称不明"),
-                    "domain": group.get("domain", "未分類"),
-                    "experiment_name": group.get("experiment_name", "実験データ"),
-                    "message": (
-                        f"【{group.get('domain', '実験データ')}】{run_count}件のCSV"
-                        f" / {row_count}行 / 条件: {', '.join(input_columns)}"
-                        f" / 結果: {', '.join(target_columns)}"
-                    ),
-                    "h_val": "N/A", "s_val": "N/A", "v_val": "N/A",
-                    "image_data": "",
-                    "type": "csv",
-                    "row_count": row_count,
-                    "run_count": run_count,
-                    "input_columns": input_columns,
-                    "target_columns": target_columns,
-                    "x_label": ", ".join(input_columns),
-                    "y_label": ", ".join(target_columns),
-                    "x_values": [],
-                    "y_values": [],
-                    "wavelengths": [],
-                    "intensities": []
-                })
+                runs = group.get("runs", [])
+                for index, run in enumerate(runs):
+                    row_count = run.get("row_count", 0)
+                    combined_timeline.append({
+                        "id": str(group["_id"]),
+                        "run_id": str(
+                            run.get("run_id", run.get("csv_file_id", index))
+                        ),
+                        "date": run.get("date", group.get("date", datetime.now())),
+                        "project_name": group.get("project_name", "未分類"),
+                        "material_name": group.get("material_name", "名称不明"),
+                        "domain": group.get("domain", "未分類"),
+                        "experiment_name": group.get("experiment_name", "実験データ"),
+                        "csv_filename": run.get("csv_filename", f"CSV {index + 1}"),
+                        "message": (
+                            f"【{group.get('domain', '実験データ')}】"
+                            f"{run.get('csv_filename', f'CSV {index + 1}')} / "
+                            f"{row_count}行（セット合計{group.get('row_count', row_count)}行）"
+                        ),
+                        "h_val": "N/A", "s_val": "N/A", "v_val": "N/A",
+                        "image_data": "",
+                        "type": "csv",
+                        "row_count": row_count,
+                        "group_row_count": group.get("row_count", row_count),
+                        "run_count": len(runs),
+                        "input_columns": input_columns,
+                        "target_columns": target_columns,
+                        "x_label": ", ".join(input_columns),
+                        "y_label": ", ".join(target_columns),
+                        "x_values": [],
+                        "y_values": [],
+                        "wavelengths": [],
+                        "intensities": []
+                    })
             
         combined_timeline.sort(key=lambda x: x['date'])
         
@@ -962,6 +978,69 @@ def list_experiments():
         traceback.print_exc()
         return {"error": "実験データ一覧の読み込みに失敗しました。"}, 500
 
+
+@app.route("/api/experiments/<experiment_id>/runs/<run_id>")
+def get_experiment_run(experiment_id, run_id):
+    if not ObjectId.is_valid(experiment_id):
+        return {"error": "実験データを選び直してください。"}, 400
+    spec = find_experiment(ObjectId(experiment_id))
+    if not spec:
+        return {"error": "選択した実験データが見つかりません。"}, 404
+
+    input_columns = spec.get("input_columns", [])
+    target_columns = spec.get("target_columns", [])
+    if not spec.get("runs") and spec.get("csv_file_id"):
+        if run_id not in {str(spec["_id"]), str(spec["csv_file_id"])}:
+            return {"error": "CSVデータが見つかりません。"}, 404
+        try:
+            csv_bytes = fs.get(spec["csv_file_id"]).read()
+            headers, rows = parse_csv_table(csv_bytes)
+            input_values, target_values = parse_numeric_columns(
+                headers, rows, input_columns, target_columns, minimum_rows=1
+            )
+            return {
+                "experiment_name": spec.get("experiment_name", "実験データ"),
+                "filename": spec.get("csv_filename", "CSV"),
+                "input_columns": input_columns,
+                "target_columns": target_columns,
+                "input_values": input_values.tolist(),
+                "target_values": target_values.tolist(),
+                "row_count": len(input_values)
+            }
+        except (KeyError, ValueError, UnicodeDecodeError, csv.Error):
+            traceback.print_exc()
+            return {"error": "CSVのグラフ用データを読み込めませんでした。"}, 500
+    run = next((
+        candidate for candidate in spec.get("runs", [])
+        if experiment_run_key(candidate, 0) == run_id
+        or str(candidate.get("run_id", "")) == run_id
+    ), None)
+    if run is None:
+        return {"error": "CSVデータが見つかりません。"}, 404
+    try:
+        if "input_values" in run and "target_values" in run:
+            input_values = np.asarray(run["input_values"], dtype=float)
+            target_values = np.asarray(run["target_values"], dtype=float)
+        else:
+            csv_bytes = fs.get(run["csv_file_id"]).read()
+            headers, rows = parse_csv_table(csv_bytes)
+            input_values, target_values = parse_numeric_columns(
+                headers, rows, input_columns, target_columns, minimum_rows=1
+            )
+        return {
+            "experiment_name": spec.get("experiment_name", "実験データ"),
+            "filename": run.get("csv_filename", "CSV"),
+            "input_columns": input_columns,
+            "target_columns": target_columns,
+            "input_values": input_values.tolist(),
+            "target_values": target_values.tolist(),
+            "row_count": len(input_values)
+        }
+    except (KeyError, ValueError, UnicodeDecodeError, csv.Error):
+        traceback.print_exc()
+        return {"error": "CSVのグラフ用データを読み込めませんでした。"}, 500
+
+
 @app.route("/api/csv/preview", methods=["POST"])
 def preview_csv():
     uploaded_file = request.files.get("file")
@@ -1030,6 +1109,7 @@ def create_experiment():
             metadata={"experiment_id": str(experiment_id), "kind": "experiment_data"}
         )
         run = {
+            "run_id": str(ObjectId()),
             "csv_file_id": file_id,
             "csv_filename": uploaded_file.filename,
             "row_count": len(input_values),
@@ -1068,6 +1148,7 @@ def create_experiment():
 
         return {
             "id": str(experiment_id),
+            "run_id": run["run_id"],
             "experiment_name": experiment_name,
             "input_columns": input_columns,
             "target_columns": target_columns,
@@ -1167,14 +1248,51 @@ def delete_message(data):
             if groups is not None else None
         )
         if target_group:
-            for run in target_group.get("runs", []):
-                fs.delete(run["csv_file_id"])
-            groups.delete_one({"_id": ObjectId(msg_id)})
-            if experiment_table_cache["cache_key"] and experiment_table_cache["cache_key"][0] == msg_id:
-                experiment_table_cache.update({"cache_key": None, "table": None})
-            if model_cache["cache_key"] and model_cache["cache_key"][0] == msg_id:
-                model_cache.update({"cache_key": None, "scaler": None, "gp_model": None})
-            emit('message deleted', {'id': msg_id}, broadcast=True)
+            run_id = data.get("run_id")
+            runs = target_group.get("runs", [])
+            if run_id:
+                target_run = next((
+                    run for index, run in enumerate(runs)
+                    if str(run.get("run_id", run.get("csv_file_id", index))) == run_id
+                ), None)
+                if target_run is None:
+                    return
+                fs.delete(target_run["csv_file_id"])
+                remaining_runs = [run for run in runs if run is not target_run]
+                if remaining_runs:
+                    remaining_row_count = sum(
+                        run.get("row_count", 0) for run in remaining_runs
+                    )
+                    groups.update_one(
+                        {"_id": target_group["_id"]},
+                        {
+                            "$set": {
+                                "runs": remaining_runs,
+                                "row_count": remaining_row_count,
+                                "run_count": len(remaining_runs)
+                            }
+                        }
+                    )
+                else:
+                    remaining_row_count = 0
+                    groups.delete_one({"_id": target_group["_id"]})
+                emit(
+                    'message deleted',
+                    {
+                        'id': msg_id,
+                        'run_id': run_id,
+                        'group_row_count': remaining_row_count
+                    },
+                    broadcast=True
+                )
+            else:
+                for run in runs:
+                    fs.delete(run["csv_file_id"])
+                groups.delete_one({"_id": ObjectId(msg_id)})
+                emit('message deleted', {'id': msg_id}, broadcast=True)
+            experiment_table_cache.update({"cache_key": None, "table": None})
+            model_cache.update({"cache_key": None, "scaler": None, "gp_model": None})
+            model_validation_cache.update({"cache_key": None, "result": None})
             return
 
         target_spec = db.spectrums.find_one({"_id": ObjectId(msg_id)})
@@ -1361,13 +1479,11 @@ model_cache = {
 def predict_dynamic():
     try:
         req_data = request.get_json() or {}
-        experiment_id = req_data.get("experiment_id")
-        if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
-            return {"error": "学習対象の実験を選択してください。"}, 400
-
-        spec = find_experiment(ObjectId(experiment_id))
-        if not spec:
-            return {"error": "選択した実験データが見つかりません。"}, 404
+        try:
+            experiment_ids = request_experiment_ids(req_data)
+            spec = build_training_experiment(experiment_ids)
+        except ValueError as error:
+            return {"error": str(error)}, 400
 
         input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
         point_total = len(input_values)
@@ -1408,19 +1524,17 @@ def predict_dynamic():
                 input_values,
                 target_values,
                 requested_points,
-                req_data.get("model_type", "auto")
+                req_data.get("model_type", "gpr")
             )
         except ValueError as error:
             return {"error": str(error)}, 400
         query = np.asarray([query_values], dtype=float)
         y_pred, y_std = predict_experiment_candidate(model, query)
         prediction_values = np.asarray(y_pred).reshape(-1)
-        std_values = include_validation_uncertainty(
-            np.asarray(y_std),
-            validation,
-            model_type,
-            target_columns
-        ).reshape(-1)
+        interval = gaussian_prediction_interval(
+            prediction_values.reshape(1, -1),
+            None if y_std is None else np.asarray(y_std).reshape(1, -1)
+        )
 
         training_ranges = {
             column: [
@@ -1436,22 +1550,28 @@ def predict_dynamic():
         }
         return {
             "experiment_id": str(spec["_id"]),
+            "experiment_ids": spec["source_ids"],
+            "training_run_count": spec["run_count"],
             "training_points": requested_points,
             "total_points": point_total,
             "input_conditions": dict(zip(input_columns, query_values)),
             "training_ranges": training_ranges,
             "out_of_range_conditions": out_of_range_conditions,
             **prediction_model_metadata(
-                model_type, selection_reason, validation, model
+                model_type, selection_reason, validation
             ),
             "predictions": dict(zip(target_columns, prediction_values.tolist())),
-            "confidence_high": dict(zip(
+            "prediction_interval": None if interval is None else {
+                "level": interval["level"],
+                "method": interval["method"]
+            },
+            "confidence_high": None if interval is None else dict(zip(
                 target_columns,
-                (prediction_values + 1.96 * std_values).tolist()
+                np.asarray(interval["upper"]).reshape(-1).tolist()
             )),
-            "confidence_low": dict(zip(
+            "confidence_low": None if interval is None else dict(zip(
                 target_columns,
-                (prediction_values - 1.96 * std_values).tolist()
+                np.asarray(interval["lower"]).reshape(-1).tolist()
             ))
         }
 
@@ -1463,13 +1583,11 @@ def predict_dynamic():
 def predict_grid():
     try:
         req_data = request.get_json() or {}
-        experiment_id = req_data.get("experiment_id")
-        if not isinstance(experiment_id, str) or not ObjectId.is_valid(experiment_id):
-            return {"error": "学習対象の実験を選択してください。"}, 400
-
-        spec = find_experiment(ObjectId(experiment_id))
-        if not spec:
-            return {"error": "選択した実験データが見つかりません。"}, 404
+        try:
+            experiment_ids = request_experiment_ids(req_data)
+            spec = build_training_experiment(experiment_ids)
+        except ValueError as error:
+            return {"error": str(error)}, 400
 
         input_columns, target_columns, input_values, target_values = load_experiment_table(spec)
         point_total = len(input_values)
@@ -1563,29 +1681,26 @@ def predict_grid():
                 input_values,
                 target_values,
                 requested_points,
-                req_data.get("model_type", "auto")
+                req_data.get("model_type", "gpr")
             )
         except ValueError as error:
             return {"error": str(error)}, 400
         predicted, predicted_std = predict_experiment_candidate(model, queries)
         prediction_values = np.asarray(predicted)
-        std_values = include_validation_uncertainty(
-            np.asarray(predicted_std),
-            validation,
-            model_type,
-            target_columns
-        )
+        std_values = None if predicted_std is None else np.asarray(predicted_std)
 
         if prediction_values.ndim == 1:
             prediction_values = prediction_values.reshape(-1, 1)
-            std_values = std_values.reshape(-1, 1)
+            if std_values is not None:
+                std_values = std_values.reshape(-1, 1)
         if y_values is not None:
             prediction_values = prediction_values.reshape(
                 grid_size, grid_size, len(target_columns)
             )
-            std_values = std_values.reshape(
-                grid_size, grid_size, len(target_columns)
-            )
+            if std_values is not None:
+                std_values = std_values.reshape(
+                    grid_size, grid_size, len(target_columns)
+                )
 
         training_ranges = {
             column: [
@@ -1624,24 +1739,82 @@ def predict_grid():
             "out_of_range_conditions": out_of_range_conditions,
             "out_of_range_axes": out_of_range_axes,
             **prediction_model_metadata(
-                model_type, selection_reason, validation, model
+                model_type, selection_reason, validation
             ),
+            "experiment_ids": spec["source_ids"],
+            "training_run_count": spec["run_count"],
             "fixed_conditions": {
                 column: float(fixed_values[index])
                 for index, column in enumerate(input_columns)
                 if column not in (x_column, y_column)
+            },
+            "prediction_interval": None if std_values is None else {
+                "level": 0.95,
+                "method": "gaussian_process_posterior_predictive"
             }
         }
         for target_index, target_column in enumerate(target_columns):
             mean_values = prediction_values[..., target_index]
-            confidence_values = std_values[..., target_index]
             response.setdefault("predictions", {})[target_column] = mean_values.tolist()
-            response.setdefault("confidence_low", {})[target_column] = (
-                mean_values - 1.96 * confidence_values
-            ).tolist()
-            response.setdefault("confidence_high", {})[target_column] = (
-                mean_values + 1.96 * confidence_values
-            ).tolist()
+            if std_values is not None:
+                interval = gaussian_prediction_interval(
+                    mean_values, std_values[..., target_index]
+                )
+                response.setdefault("confidence_low", {})[target_column] = (
+                    interval["lower"].tolist()
+                )
+                response.setdefault("confidence_high", {})[target_column] = (
+                    interval["upper"].tolist()
+                )
+
+        measured_series = []
+        source_runs = load_experiment_runs(spec)
+        max_points_per_run = max(1, 2000 // len(source_runs))
+        y_index = input_columns.index(y_column) if y_column is not None else None
+        target_index = target_columns.index(req_data.get("target_column")) \
+            if req_data.get("target_column") in target_columns else 0
+        for run in source_runs:
+            run_inputs = run["input_values"]
+            run_targets = run["target_values"]
+            if len(run_inputs) > max_points_per_run:
+                run_inputs, run_targets = select_evenly_spaced_rows(
+                    run_inputs, run_targets, max_points_per_run
+                )
+            series = {
+                "label": run["label"],
+                "x_values": run_inputs[:, x_index].tolist(),
+                "target_values": run_targets[:, target_index].tolist()
+            }
+            if y_index is not None:
+                series["y_values"] = run_inputs[:, y_index].tolist()
+            measured_series.append(series)
+        response["measured_data"] = measured_series
+        if req_data.get("compare_models") and y_column is None:
+            comparison_predictions = {}
+            x_train, y_train = select_evenly_spaced_rows(
+                input_values, target_values, requested_points
+            )
+            for candidate_type in MODEL_LABELS:
+                candidate_model = model if candidate_type == model_type else fit_experiment_candidate(
+                    candidate_type,
+                    x_train,
+                    y_train,
+                    input_columns,
+                    target_columns,
+                    optimize_gpr=False
+                )
+                candidate_values, _ = predict_experiment_candidate(
+                    candidate_model, queries
+                )
+                candidate_values = np.asarray(candidate_values).reshape(
+                    grid_size, len(target_columns)
+                )
+                comparison_predictions[candidate_type] = {
+                    column: candidate_values[:, index].tolist()
+                    for index, column in enumerate(target_columns)
+                }
+            response["model_comparison_predictions"] = comparison_predictions
+            response["model_labels"] = MODEL_LABELS
         return response
     except Exception as e:
         traceback.print_exc()
